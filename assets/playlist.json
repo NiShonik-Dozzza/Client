@@ -1,0 +1,32 @@
+[
+  {
+    "filename": "1.png",
+    "start_date": "2020-01-01T00:00:00",
+    "loop": false
+  },
+  {
+    "filename": "test.mp4",
+    "start_date": "2020-01-01T00:00:00",
+    "loop": false
+  },
+  {
+    "filename": "2.jpg",
+    "start_date": "2020-01-01T00:00:00",
+    "loop": false
+  },
+  {
+    "filename": "3.jpeg",
+    "start_date": "2020-01-01T00:00:00",
+    "loop": false
+  },
+  {
+    "filename": "4.png",
+    "start_date": "2020-01-01T00:00:00",
+    "loop": false
+  },
+  {
+    "filename": "SP.mp4",
+    "start_date": "2020-01-01T00:00:00",
+    "loop": true
+  }
+]
