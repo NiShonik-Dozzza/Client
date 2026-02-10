@@ -1,18 +1,20 @@
-// lib/views/player_screen.dart
 import 'dart:async';
-import 'dart:io' show File, Platform;
+import 'dart:io';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
-import 'package:path/path.dart' as path;
+import 'package:path/path.dart' as p;
 
 import '../controllers/playlist_controller.dart';
 import '../models/playlist_item.dart';
+import '../services/app_logger.dart';
+import '../services/config_service.dart';
 
-enum _Mode { image, video, none }
+enum _Mode { image, video, black }
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key});
@@ -22,35 +24,30 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // ✅ ТВОЯ ПАПКА С ЛОКАЛЬНЫМИ МЕДИА НА WINDOWS
-  static const String windowsMediaDir =
-      r'C:\Users\NNGASU\Desktop\Client-main\assets\media';
-
   late final Player _player;
   late final VideoController _videoController;
 
-  List<PlaylistItem> _activeItems = [];
-  int _currentIndex = 0;
+  final _cfg = ConfigService();
+
+  Timer? _tick;       // проверяем расписание
+  Timer? _stopTimer;  // точный переход на stop_date
+  Timer? _imageOnceTimer;
 
   bool _initialized = false;
   bool _isDisposed = false;
 
-  Timer? _imageTimer;
+  PlaylistItem? _current;
+  _Mode _mode = _Mode.black;
 
-  _Mode _mode = _Mode.none;
-
-  // Для картинки:
+  // картинка
   bool _imageIsFile = false;
-  String _imagePathOrAsset = '';
+  String _imagePath = '';
 
-  // ✅ ВАЖНО:
-  // completed может прилетать от stop()/reset. Реагируем на completed
-  // только если мы реально запустили видео и ожидаем его конец.
-  bool _expectVideoCompletion = false;
+  // completed на Windows может быть “шумным”, реагируем только если это видео и мы его ждём
+  bool _expectVideoCompleted = false;
 
-  // “Токен” текущего проигрывания, чтобы старые события не ломали очередь.
-  int _playSeq = 0;
-  int _currentVideoSeq = -1;
+  // debug overlay
+  bool _debug = true; // можешь поставить false по умолчанию
 
   @override
   void initState() {
@@ -59,213 +56,197 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _player = Player();
     _videoController = VideoController(_player);
 
-    _player.stream.error.listen((e) => debugPrint('❌ media_kit error: $e'));
+    _player.stream.error.listen((e) => AppLogger.log('media_kit error: $e'));
 
     _player.stream.completed.listen((_) {
-      debugPrint(
-        '✅ completed (expect=$_expectVideoCompletion, mode=$_mode, seq=$_currentVideoSeq)',
-      );
-
-      // Игнорируем “левые” completed (stop/reset/и т.д.)
-      if (!_expectVideoCompletion) return;
+      if (_isDisposed) return;
+      if (!_expectVideoCompleted) return;
       if (_mode != _Mode.video) return;
 
-      // Чтобы не было дублей
-      _expectVideoCompletion = false;
-
-      if (!_isDisposed) _nextItem();
+      _expectVideoCompleted = false;
+      _onVideoCompleted();
     });
 
-    _loadActiveItems();
+    // F12 — toggle debug overlay (на Windows удобно)
+    HardwareKeyboard.instance.addHandler(_onKey);
+
+    _boot();
   }
 
-  Future<void> _loadActiveItems() async {
-    try {
-      final controller = Get.find<PlaylistController>();
-
-      // Плейлист может грузиться в onInit контроллера,
-      // но на всякий случай дождёмся.
-      if (controller.items.isEmpty) {
-        await controller.loadPlaylist();
-      }
-      while (controller.isLoading) {
-        await Future.delayed(const Duration(milliseconds: 50));
-      }
-
-      final items = controller.activeItems;
-
-      setState(() {
-        _activeItems = items;
-        _currentIndex = 0;
-        _initialized = true;
-      });
-
-      if (_activeItems.isNotEmpty) {
-        await _playItem(0);
-      }
-    } catch (e) {
-      debugPrint('❌ _loadActiveItems error: $e');
-      setState(() {
-        _activeItems = [];
-        _initialized = true;
-      });
+  bool _onKey(KeyEvent e) {
+    if (e is KeyDownEvent && e.logicalKey == LogicalKeyboardKey.f12) {
+      setState(() => _debug = !_debug);
+      return true;
     }
-  }
-
-  bool _isAbsPath(String p) {
-    if (p.startsWith('/')) return true;
-    if (p.length >= 3 && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) return true;
     return false;
   }
 
-  Future<String?> _resolveDiskPathIfAny(String filename) async {
-    final name = path.basename(filename);
+  Future<void> _boot() async {
+    try {
+      final controller = Get.find<PlaylistController>();
+      await _cfg.load();
 
-    if (_isAbsPath(filename)) {
-      final f = File(filename);
-      if (await f.exists()) return f.path;
-      return null;
+      // реагируем на hot reload плейлиста
+      ever<int>(controller.version, (_) => _applySchedule());
+
+      setState(() => _initialized = true);
+
+      await _applySchedule();
+
+      _tick = Timer.periodic(const Duration(seconds: 1), (_) => _applySchedule());
+    } catch (e) {
+      await AppLogger.log('boot error: $e');
+      setState(() => _initialized = true);
     }
-
-    if (!kIsWeb && Platform.isWindows) {
-      final p = path.join(windowsMediaDir, name);
-      final f = File(p);
-      if (await f.exists()) return f.path;
-      return null;
-    }
-
-    return null;
   }
 
-  Future<void> _playItem(int index) async {
+  Future<String?> _diskPathIfExists(String mediaRoot, String filename) async {
+    if (kIsWeb) return null;
+
+    final name = p.basename(filename);
+
+    // если filename абсолютный — используем его
+    if (p.isAbsolute(filename)) {
+      final f = File(filename);
+      return (await f.exists()) ? f.path : null;
+    }
+
+    final full = ConfigService.joinMedia(mediaRoot, name);
+    final f = File(full);
+    return (await f.exists()) ? f.path : null;
+  }
+
+  String _assetImagePath(String filename) => 'assets/media/${p.basename(filename)}';
+  String _assetMediaUri(String filename) => 'asset:///assets/media/${p.basename(filename)}';
+
+  Future<void> _applySchedule() async {
     if (_isDisposed) return;
-    if (_activeItems.isEmpty) return;
 
-    _imageTimer?.cancel();
+    final controller = Get.find<PlaylistController>();
+    final now = DateTime.now();
 
-    if (index >= _activeItems.length) index = 0;
-    if (index < 0) index = 0;
+    final next = controller.currentItem(now);
 
-    // Новый токен запуска
-    final int seq = ++_playSeq;
+    // нет активного элемента
+    if (next == null) {
+      if (_current != null) {
+        await _stopEverything();
+        setState(() {
+          _current = null;
+          _mode = _Mode.black;
+        });
+      }
+      return;
+    }
 
-    setState(() {
-      _currentIndex = index;
-      _mode = _Mode.none;
-      _imageIsFile = false;
-      _imagePathOrAsset = '';
-    });
+    // если тот же элемент — ничего не делаем
+    final same = _current != null &&
+        _current!.filename == next.filename &&
+        _current!.startDate == next.startDate &&
+        _current!.stopDate == next.stopDate;
 
-    final item = _activeItems[_currentIndex];
-    final name = path.basename(item.filename);
+    if (same) return;
 
-    debugPrint('▶️ PLAY seq=$seq idx=$_currentIndex file=${item.filename} (name=$name)');
+    _current = next;
 
-    // Любой переход в новый item сбрасывает ожидание video completed
-    _expectVideoCompletion = false;
-    _currentVideoSeq = -1;
+    // ставим таймер на stop_date (если есть)
+    _stopTimer?.cancel();
+    if (next.stopDate != null) {
+      final dur = next.stopDate!.difference(now);
+      if (!dur.isNegative) {
+        _stopTimer = Timer(dur, () => _applySchedule());
+      }
+    }
+
+    await _playCurrent(next);
+  }
+
+  Future<void> _stopEverything() async {
+    _imageOnceTimer?.cancel();
+    _expectVideoCompleted = false;
+    try {
+      await _player.pause();
+      await _player.setVolume(0);
+      await _player.stop();
+    } catch (_) {}
+  }
+
+  Future<void> _playCurrent(PlaylistItem item) async {
+    await _stopEverything();
+
+    final cfg = await _cfg.load();
+    final mediaRoot = cfg.mediaRoot;
 
     if (item.isImage) {
-      // Глушим звук и останавливаем видео (completed от stop будет проигнорирован)
-      try {
-        await _player.pause();
-        await _player.setVolume(0);
-        await _player.stop();
-      } catch (_) {}
+      final disk = await _diskPathIfExists(mediaRoot, item.filename);
+      setState(() {
+        _mode = _Mode.image;
+        _imageIsFile = disk != null;
+        _imagePath = disk ?? _assetImagePath(item.filename);
+      });
 
-      final diskPath = await _resolveDiskPathIfAny(item.filename);
-      if (diskPath != null) {
-        debugPrint('🖼 IMAGE source = FILE: $diskPath');
-        setState(() {
-          _mode = _Mode.image;
-          _imageIsFile = true;
-          _imagePathOrAsset = diskPath;
-        });
-      } else {
-        debugPrint('🖼 IMAGE source = ASSET: ${item.fullPath}');
-        setState(() {
-          _mode = _Mode.image;
-          _imageIsFile = false;
-          _imagePathOrAsset = item.fullPath;
+      // loop=false: показать один раз durationSeconds, потом чёрный до смены расписания
+      if (!item.loop) {
+        final now = DateTime.now();
+        final left = item.stopDate == null ? null : item.stopDate!.difference(now);
+        final showFor = Duration(seconds: item.durationSeconds);
+        final dur = (left == null) ? showFor : (showFor < left ? showFor : left);
+
+        _imageOnceTimer = Timer(dur, () {
+          if (_isDisposed) return;
+          setState(() => _mode = _Mode.black);
         });
       }
 
-      _imageTimer = Timer(Duration(seconds: item.durationSeconds), () {
-        if (!_isDisposed) _nextItem();
-      });
+      await AppLogger.log('SHOW IMAGE: ${item.filename} (loop=${item.loop})');
       return;
     }
 
     if (item.isVideo) {
-      // На видео включаем звук обратно
+      setState(() => _mode = _Mode.video);
+
+      final disk = await _diskPathIfExists(mediaRoot, item.filename);
+      final src = disk ?? _assetMediaUri(item.filename);
+
       try {
         await _player.setVolume(100);
-      } catch (_) {}
+        await _player.open(Playlist([Media(src)]), play: true);
 
-      // ВАЖНО: stop делаем ДО того, как начнём “ожидать completed”
-      try {
-        await _player.stop();
-      } catch (_) {}
+        // ждём completed только после успешного open
+        _expectVideoCompleted = true;
 
-      setState(() {
-        _mode = _Mode.video;
-      });
-
-      // 1) Пытаемся открыть файл с диска
-      final diskPath = await _resolveDiskPathIfAny(item.filename);
-      if (diskPath != null) {
-        try {
-          debugPrint('🎬 VIDEO source = FILE: $diskPath');
-
-          await _player.open(Playlist([Media(diskPath)]), play: true);
-
-          // ✅ Только ПОСЛЕ успешного open/play начинаем ждать completed
-          _currentVideoSeq = seq;
-          _expectVideoCompletion = true;
-
-          return;
-        } catch (e) {
-          debugPrint('❌ video open (disk) failed: $e');
-        }
-      } else {
-        debugPrint('⚠️ video not found on disk: $name');
-      }
-
-      // 2) fallback на asset
-      final assetUri = 'asset:///${item.fullPath}';
-      try {
-        debugPrint('🎬 VIDEO source = ASSET: $assetUri');
-
-        await _player.open(Playlist([Media(assetUri)]), play: true);
-
-        _currentVideoSeq = seq;
-        _expectVideoCompletion = true;
-
-        return;
+        await AppLogger.log('PLAY VIDEO: ${item.filename} src=$src (loop=${item.loop})');
       } catch (e) {
-        debugPrint('❌ video open (asset) failed: $e');
+        _expectVideoCompleted = false;
+        await AppLogger.log('VIDEO OPEN FAILED: ${item.filename} error=$e');
+        setState(() => _mode = _Mode.black);
       }
-
-      debugPrint('⚠️ skip video: ${item.filename}');
-      if (!_isDisposed) _nextItem();
       return;
     }
 
-    debugPrint('⚠️ unsupported file type: ${item.filename}');
-    _nextItem();
+    // неизвестный формат
+    setState(() => _mode = _Mode.black);
+    await AppLogger.log('UNSUPPORTED: ${item.filename}');
   }
 
-  void _nextItem() {
-    if (_activeItems.isEmpty) return;
+  void _onVideoCompleted() {
+    final item = _current;
+    if (item == null) return;
 
-    final current = _activeItems[_currentIndex];
+    // loop=false → после окончания видео чёрный экран до смены расписания
+    if (!item.loop) {
+      setState(() => _mode = _Mode.black);
+      return;
+    }
 
-    // loop=true -> повтор текущего
-    // loop=false -> следующий
-    if (current.loop) {
-      _playItem(_currentIndex);
+    // loop=true → если мы всё ещё внутри окна, перезапускаем
+    final now = DateTime.now();
+    final stillInWindow = item.stopDate == null ? true : now.isBefore(item.stopDate!);
+    if (stillInWindow) {
+      _playCurrent(item); // перезапуск этого же видео
     } else {
-      _playItem(_currentIndex + 1);
+      setState(() => _mode = _Mode.black);
+      _applySchedule();
     }
   }
 
@@ -278,78 +259,55 @@ class _PlayerScreenState extends State<PlayerScreen> {
       );
     }
 
-    if (_activeItems.isEmpty) {
-      return const Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(
-          child: Text(
-            'Нет активных медиа-элементов',
-            style: TextStyle(color: Colors.white70, fontSize: 18),
-          ),
-        ),
-      );
-    }
-
-    final item = _activeItems[_currentIndex];
+    final item = _current;
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (_mode == _Mode.image)
+          if (_mode == _Mode.image && item != null)
             _imageIsFile
                 ? Image.file(
-              File(_imagePathOrAsset),
+              File(_imagePath),
               fit: BoxFit.contain,
-              errorBuilder: (context, error, stack) {
-                debugPrint('❌ IMAGE FILE LOAD ERROR: $error');
-                Future.microtask(() {
-                  if (!_isDisposed) _nextItem();
-                });
-                return const Center(
-                  child: Text(
-                    'Ошибка загрузки изображения (file)',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                );
-              },
+              errorBuilder: (_, e, __) => const Center(
+                child: Text('Ошибка загрузки изображения (file)', style: TextStyle(color: Colors.white)),
+              ),
             )
                 : Image.asset(
-              _imagePathOrAsset,
+              _imagePath,
               fit: BoxFit.contain,
-              errorBuilder: (context, error, stack) {
-                debugPrint('❌ IMAGE ASSET LOAD ERROR: $error');
-                Future.microtask(() {
-                  if (!_isDisposed) _nextItem();
-                });
-                return const Center(
-                  child: Text(
-                    'Ошибка загрузки изображения (asset)',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                );
-              },
+              errorBuilder: (_, e, __) => const Center(
+                child: Text('Ошибка загрузки изображения (asset)', style: TextStyle(color: Colors.white)),
+              ),
             )
+          else if (_mode == _Mode.video)
+            Video(controller: _videoController, fit: BoxFit.contain)
           else
-            Video(
-              controller: _videoController,
-              fit: BoxFit.contain,
-            ),
+            const SizedBox.shrink(),
 
-          Positioned(
-            left: 12,
-            bottom: 12,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              color: Colors.black54,
-              child: Text(
-                '${_currentIndex + 1}/${_activeItems.length} • ${item.filename}\n'
-                    'mode=$_mode expect=$_expectVideoCompletion seq=$_currentVideoSeq',
-                style: const TextStyle(color: Colors.white70, fontSize: 12),
+          if (_debug)
+            Positioned(
+              left: 12,
+              bottom: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                color: Colors.black54,
+                child: Text(
+                  'now=${DateTime.now()}\n'
+                      'mode=$_mode\n'
+                      'item=${item?.filename ?? "-"}\n'
+                      'start=${item?.startDate}\n'
+                      'stop=${item?.stopDate}\n'
+                      'loop=${item?.loop}\n'
+                      'expectCompleted=$_expectVideoCompleted\n'
+                      'imgIsFile=$_imageIsFile\n'
+                      'imgPath=$_imagePath',
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
               ),
             ),
-          ),
         ],
       ),
     );
@@ -358,7 +316,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void dispose() {
     _isDisposed = true;
-    _imageTimer?.cancel();
+    _tick?.cancel();
+    _stopTimer?.cancel();
+    _imageOnceTimer?.cancel();
+    HardwareKeyboard.instance.removeHandler(_onKey);
     _player.dispose();
     super.dispose();
   }

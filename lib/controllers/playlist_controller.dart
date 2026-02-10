@@ -1,63 +1,119 @@
 // lib/controllers/playlist_controller.dart
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:get/get.dart';
-import 'package:flutter/foundation.dart';
+
 import '../models/playlist_item.dart';
+import '../services/app_logger.dart';
+import '../services/app_paths.dart';
 
 class PlaylistController extends GetxController {
   final RxList<PlaylistItem> _items = <PlaylistItem>[].obs;
   final RxBool _isLoading = false.obs;
 
+  /// Увеличивается при каждом успешном reload — удобно для PlayerScreen (ever/worker)
+  final RxInt version = 0.obs;
+
+  DateTime? _lastDiskMtime;
+  Timer? _watchTimer;
+
   List<PlaylistItem> get items => _items;
   bool get isLoading => _isLoading.value;
 
-  // Только активные элементы (дата начала <= текущей)
-  List<PlaylistItem> get activeItems => _items
-      .where((item) => DateTime.now().isAfter(item.startDate) ||
-      DateTime.now().isAtSameMomentAs(item.startDate))
-      .toList();
-
   @override
   void onInit() {
-    loadPlaylist();
     super.onInit();
+    loadPlaylist();
+    _watchTimer = Timer.periodic(const Duration(seconds: 5), (_) => _maybeReloadFromDisk());
+  }
+
+  @override
+  void onClose() {
+    _watchTimer?.cancel();
+    super.onClose();
+  }
+
+  Future<void> _maybeReloadFromDisk() async {
+    try {
+      final file = await AppPaths.playlistFile();
+      if (!await file.exists()) return; // дискового плейлиста нет — не трогаем
+
+      final stat = await file.stat();
+      final mtime = stat.modified;
+
+      if (_lastDiskMtime == null || mtime.isAfter(_lastDiskMtime!)) {
+        await AppLogger.log('playlist.json changed → reload');
+        await loadPlaylist();
+      }
+    } catch (e) {
+      await AppLogger.log('playlist watcher error: $e');
+    }
   }
 
   Future<void> loadPlaylist() async {
+    _isLoading.value = true;
+
     try {
-      _isLoading.value = true;
-      final jsonString = await rootBundle.loadString('assets/playlist.json');
-      debugPrint('Загружен playlist.json: $jsonString'); // ← сюда выводится содержимое
-      final jsonList = json.decode(jsonString) as List;
-      _items.assignAll(
-        jsonList.map((e) => PlaylistItem.fromJson(e)).toList(),
-      );
+      final disk = await AppPaths.playlistFile();
+
+      String jsonString;
+      if (await disk.exists()) {
+        jsonString = await disk.readAsString();
+        _lastDiskMtime = (await disk.stat()).modified;
+        await AppLogger.log('Playlist loaded from DISK: ${disk.path}');
+      } else {
+        jsonString = await rootBundle.loadString('assets/playlist.json');
+        await AppLogger.log('Playlist loaded from ASSETS');
+      }
+
+      // Парсим
+      final raw = (jsonDecode(jsonString) as List).cast<dynamic>();
+      final parsed = raw
+          .map((e) => PlaylistItem.fromJson((e as Map).cast<String, dynamic>()))
+          .toList();
+
+      // Сортируем по start_date
+      parsed.sort((a, b) => a.startDate.compareTo(b.startDate));
+
+      // Нормализуем stop_date:
+      // если stop_date отсутствует, ставим равным следующему start_date
+      final normalized = <PlaylistItem>[];
+      for (int i = 0; i < parsed.length; i++) {
+        final cur = parsed[i];
+        DateTime? stop = cur.stopDate;
+
+        if (stop == null && i + 1 < parsed.length) {
+          stop = parsed[i + 1].startDate;
+        }
+
+        normalized.add(cur.copyWith(stopDate: stop));
+      }
+
+      _items.assignAll(normalized);
+      version.value++;
+
+      await AppLogger.log('Playlist items: ${_items.length}, version=${version.value}');
+      for (final it in _items) {
+        await AppLogger.log(' - ${it.filename} | ${it.startDate} -> ${it.stopDate} | loop=${it.loop}');
+      }
     } catch (e) {
-      print('Ошибка загрузки плейлиста: $e');
+      _items.clear();
+      await AppLogger.log('Playlist load error: $e');
     } finally {
       _isLoading.value = false;
     }
   }
 
-  void addItem(PlaylistItem item) {
-    _items.add(item);
-    savePlaylist();
-  }
+  /// Элемент, который должен быть активен в момент now.
+  /// Если есть перекрытия — берём самый “поздний” по startDate (приоритет последнего).
+  PlaylistItem? currentItem(DateTime now) {
+    final active = _items.where((i) => i.isActiveAt(now)).toList();
+    if (active.isEmpty) return null;
 
-  void removeItem(int index) {
-    _items.removeAt(index);
-    savePlaylist();
-  }
-
-  // В демо-режиме мы не можем перезаписать assets, но в реальном приложении:
-  // — сохраним в DocumentsDirectory
-  // — или отправим на сервер
-  Future<void> savePlaylist() async {
-    // В assets НЕЛЬЗЯ писать! Это только для чтения.
-    // В продакшене используй path_provider.
-    // Для демо — просто покажем в логе.
-    final jsonList = _items.map((item) => item.toJson()).toList();
-    debugPrint('Сохраняем плейлист (в проде — в файл):\n${JsonEncoder.withIndent('  ').convert(jsonList)}');
+    active.sort((a, b) => b.startDate.compareTo(a.startDate));
+    return active.first;
   }
 }

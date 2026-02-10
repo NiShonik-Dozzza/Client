@@ -1,32 +1,8 @@
 [
-  {
-    "filename": "1.png",
-    "start_date": "2020-01-01T00:00:00",
-    "loop": false
-  },
-  {
-    "filename": "test.mp4",
-    "start_date": "2020-01-01T00:00:00",
-    "loop": false
-  },
-  {
-    "filename": "2.jpg",
-    "start_date": "2020-01-01T00:00:00",
-    "loop": false
-  },
-  {
-    "filename": "3.jpeg",
-    "start_date": "2020-01-01T00:00:00",
-    "loop": false
-  },
-  {
-    "filename": "4.png",
-    "start_date": "2020-01-01T00:00:00",
-    "loop": false
-  },
-  {
-    "filename": "SP.mp4",
-    "start_date": "2020-01-01T00:00:00",
-    "loop": true
-  }
+  { "filename": "1.png",    "start_date": "2026-02-10T15:34:00", "stop_date": "2026-02-10T15:37:00", "loop": true },
+  { "filename": "test.mp4", "start_date": "2026-02-10T15:35:00", "stop_date": "2026-02-10T15:36:00", "loop": true },
+  { "filename": "2.jpg",    "start_date": "2026-02-10T15:36:00", "stop_date": "2026-02-10T15:37:00", "loop": true },
+  { "filename": "3.jpeg",   "start_date": "2026-02-10T15:37:00", "stop_date": "2026-02-10T15:38:00", "loop": true },
+  { "filename": "4.png",    "start_date": "2026-02-10T15:38:00", "stop_date": "2026-02-10T15:39:00", "loop": true },
+  { "filename": "SP.mp4",   "start_date": "2026-02-10T15:39:00", "stop_date": "2026-02-10T15:40:00", "loop": true }
 ]

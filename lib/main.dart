@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:media_kit/media_kit.dart';
 
@@ -10,10 +9,6 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
 
-  // Полный экран (киоск)
-  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-
-  // ✅ Регистрируем контроллер ДО runApp
   Get.put(PlaylistController(), permanent: true);
 
   runApp(const App());
