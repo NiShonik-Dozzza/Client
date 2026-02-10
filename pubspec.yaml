@@ -35,7 +35,7 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   get: ^4.7.3
-#  video_player: ^2.10.1 От команды флаттера, но десктоп не поддерживаетя
+  #  video_player: ^2.10.1 От команды флаттера, но десктоп не поддерживаетя
   path_provider: ^2.1.5
   path: ^1.9.1
   media_kit: ^1.2.3 # Типа альтернатива
