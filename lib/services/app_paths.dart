@@ -22,6 +22,16 @@ class AppPaths {
     return File(p.join(root.path, 'config.json'));
   }
 
+  static Future<File> deviceFile() async {
+    final root = await rootDir();
+    return File(p.join(root.path, 'device.json'));
+  }
+
+  static Future<File> manifestFile() async {
+    final root = await rootDir();
+    return File(p.join(root.path, 'manifest.json'));
+  }
+
   static Future<File> logFile() async {
     final root = await rootDir();
     return File(p.join(root.path, 'log.txt'));

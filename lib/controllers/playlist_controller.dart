@@ -1,119 +1,266 @@
-// lib/controllers/playlist_controller.dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
-import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/foundation.dart';
 import 'package:get/get.dart';
 
-import '../models/playlist_item.dart';
+import '../models/manifest.dart';
+import '../services/api_service.dart';
 import '../services/app_logger.dart';
-import '../services/app_paths.dart';
+import '../services/config_service.dart';
+import '../services/device_store.dart';
+import '../services/manifest_store.dart';
+import '../services/media_cache_service.dart';
 
 class PlaylistController extends GetxController {
-  final RxList<PlaylistItem> _items = <PlaylistItem>[].obs;
   final RxBool _isLoading = false.obs;
-
-  /// Увеличивается при каждом успешном reload — удобно для PlayerScreen (ever/worker)
   final RxInt version = 0.obs;
 
-  DateTime? _lastDiskMtime;
-  Timer? _watchTimer;
+  final _config = ConfigService();
+  final _deviceStore = DeviceStore();
+  final _manifestStore = ManifestStore();
+  late final MediaCacheService _cache;
 
-  List<PlaylistItem> get items => _items;
+  ApiService? _api;
+  Manifest? _manifest;
+  DeviceAuth? _auth;
+  String _mediaRoot = '';
+  String? _nowPlaying;
+
+  Timer? _manifestTimer;
+  Timer? _heartbeatTimer;
+  int _manifestFailures = 0;
+  bool _manifestInFlight = false;
+  final _rng = Random();
+
+  static const Duration _manifestBaseInterval = Duration(seconds: 30);
+  static const Duration _heartbeatInterval = Duration(seconds: 25);
+  static const List<int> _manifestBackoffSeconds = [2, 5, 10, 20, 30];
+
   bool get isLoading => _isLoading.value;
+  Manifest? get manifest => _manifest;
+  String get currentRevision => _manifest?.revision ?? '';
 
   @override
   void onInit() {
     super.onInit();
-    loadPlaylist();
-    _watchTimer = Timer.periodic(const Duration(seconds: 5), (_) => _maybeReloadFromDisk());
+    _boot();
   }
 
   @override
   void onClose() {
-    _watchTimer?.cancel();
+    _manifestTimer?.cancel();
+    _heartbeatTimer?.cancel();
     super.onClose();
   }
 
-  Future<void> _maybeReloadFromDisk() async {
-    try {
-      final file = await AppPaths.playlistFile();
-      if (!await file.exists()) return; // дискового плейлиста нет — не трогаем
-
-      final stat = await file.stat();
-      final mtime = stat.modified;
-
-      if (_lastDiskMtime == null || mtime.isAfter(_lastDiskMtime!)) {
-        await AppLogger.log('playlist.json changed → reload');
-        await loadPlaylist();
-      }
-    } catch (e) {
-      await AppLogger.log('playlist watcher error: $e');
-    }
-  }
-
-  Future<void> loadPlaylist() async {
+  Future<void> _boot() async {
     _isLoading.value = true;
-
     try {
-      final disk = await AppPaths.playlistFile();
+      final cfg = await _config.load();
+      _mediaRoot = cfg.mediaRoot;
+      _api = ApiService(apiBase: cfg.apiBase);
+      _cache = MediaCacheService(onForbidden: _fetchManifest);
 
-      String jsonString;
-      if (await disk.exists()) {
-        jsonString = await disk.readAsString();
-        _lastDiskMtime = (await disk.stat()).modified;
-        await AppLogger.log('Playlist loaded from DISK: ${disk.path}');
-      } else {
-        jsonString = await rootBundle.loadString('assets/playlist.json');
-        await AppLogger.log('Playlist loaded from ASSETS');
+      _auth = await _deviceStore.read();
+      _auth ??= DeviceAuth(deviceId: _generateDeviceId(), token: '', name: _deviceName());
+      await _deviceStore.save(_auth!);
+
+      await _registerIfNeeded();
+
+      final cachedManifest = await _manifestStore.read();
+      if (cachedManifest != null) {
+        _setManifest(cachedManifest, source: 'cache');
       }
 
-      // Парсим
-      final raw = (jsonDecode(jsonString) as List).cast<dynamic>();
-      final parsed = raw
-          .map((e) => PlaylistItem.fromJson((e as Map).cast<String, dynamic>()))
-          .toList();
+      await _fetchManifest();
 
-      // Сортируем по start_date
-      parsed.sort((a, b) => a.startDate.compareTo(b.startDate));
-
-      // Нормализуем stop_date:
-      // если stop_date отсутствует, ставим равным следующему start_date
-      final normalized = <PlaylistItem>[];
-      for (int i = 0; i < parsed.length; i++) {
-        final cur = parsed[i];
-        DateTime? stop = cur.stopDate;
-
-        if (stop == null && i + 1 < parsed.length) {
-          stop = parsed[i + 1].startDate;
-        }
-
-        normalized.add(cur.copyWith(stopDate: stop));
-      }
-
-      _items.assignAll(normalized);
-      version.value++;
-
-      await AppLogger.log('Playlist items: ${_items.length}, version=${version.value}');
-      for (final it in _items) {
-        await AppLogger.log(' - ${it.filename} | ${it.startDate} -> ${it.stopDate} | loop=${it.loop}');
-      }
+      _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) => _sendHeartbeat());
     } catch (e) {
-      _items.clear();
-      await AppLogger.log('Playlist load error: $e');
+      await AppLogger.log('boot error: $e');
     } finally {
       _isLoading.value = false;
     }
   }
 
-  /// Элемент, который должен быть активен в момент now.
-  /// Если есть перекрытия — берём самый “поздний” по startDate (приоритет последнего).
-  PlaylistItem? currentItem(DateTime now) {
-    final active = _items.where((i) => i.isActiveAt(now)).toList();
-    if (active.isEmpty) return null;
+  Future<void> _registerIfNeeded({bool force = false}) async {
+    final api = _api;
+    final auth = _auth;
+    if (api == null || auth == null) return;
+    if (auth.hasToken && !force) return;
 
-    active.sort((a, b) => b.startDate.compareTo(a.startDate));
+    try {
+      final registered = await api.register(deviceId: auth.deviceId, name: auth.name ?? _deviceName());
+      _auth = DeviceAuth(deviceId: registered.deviceId, token: registered.token, name: auth.name ?? registered.name);
+      await _deviceStore.save(_auth!);
+      await AppLogger.log('registered device_id=${_auth!.deviceId}');
+    } catch (e) {
+      await AppLogger.log('register failed: $e');
+    }
+  }
+
+  Future<void> _fetchManifest() async {
+    final api = _api;
+    final auth = _auth;
+    if (api == null || auth == null) return;
+
+    if (_manifestInFlight) return;
+    _manifestInFlight = true;
+
+    try {
+      if (!auth.hasToken) {
+        await _registerIfNeeded();
+      }
+      final refreshed = _auth;
+      if (refreshed == null) return;
+
+      final manifest = await api.fetchManifest(deviceId: refreshed.deviceId, token: refreshed.token);
+      _manifestFailures = 0;
+      if (_manifest?.revision == manifest.revision) return;
+
+      _setManifest(manifest, source: 'api');
+      await _manifestStore.save(manifest);
+      _prefetchMedia(manifest);
+    } catch (e) {
+      _manifestFailures++;
+      await AppLogger.log('manifest fetch failed: $e');
+    } finally {
+      _manifestInFlight = false;
+      _scheduleManifestFetch();
+    }
+  }
+
+  void _setManifest(Manifest manifest, {required String source}) {
+    _manifest = manifest;
+    version.value++;
+    unawaited(AppLogger.log('Manifest updated ($source): rev=${manifest.revision} items=${manifest.items.length}'));
+  }
+
+  void _prefetchMedia(Manifest manifest) {
+    final now = DateTime.now();
+    final prefetch = Duration(seconds: manifest.prefetchSeconds);
+    final horizon = now.add(prefetch);
+
+    final ids = <int>{};
+    for (final item in manifest.items) {
+      if (item.endTime.isBefore(now)) continue;
+      if (item.startTime.isAfter(horizon)) continue;
+
+      if (item.contentType == ManifestContentType.media) {
+        ids.add(item.contentId);
+      } else {
+        final playlist = manifest.playlistById(item.contentId);
+        if (playlist == null) continue;
+        for (final pItem in playlist.items) {
+          ids.add(pItem.mediaId);
+        }
+      }
+    }
+
+    for (final id in ids) {
+      final media = manifest.mediaById(id);
+      if (media != null) {
+        unawaited(ensureMediaFile(media));
+      }
+    }
+  }
+
+  Future<void> updateNowPlaying(String? nowPlaying) async {
+    if (_nowPlaying == nowPlaying) return;
+    _nowPlaying = nowPlaying;
+    unawaited(_sendHeartbeat());
+  }
+
+  void _scheduleManifestFetch() {
+    _manifestTimer?.cancel();
+    final delay = _manifestFailures == 0 ? _manifestBaseInterval : _backoffDelay(_manifestFailures);
+    _manifestTimer = Timer(delay, _fetchManifest);
+  }
+
+  Duration _backoffDelay(int failures) {
+    final index = (failures - 1).clamp(0, _manifestBackoffSeconds.length - 1);
+    final base = Duration(seconds: _manifestBackoffSeconds[index]);
+    return _withJitter(base);
+  }
+
+  Duration _withJitter(Duration base) {
+    final jitter = 0.8 + (_rng.nextDouble() * 0.4);
+    final ms = (base.inMilliseconds * jitter).round();
+    return Duration(milliseconds: ms < 500 ? 500 : ms);
+  }
+
+  Future<void> _sendHeartbeat() async {
+    final api = _api;
+    final auth = _auth;
+    if (api == null || auth == null) return;
+
+    try {
+      if (!auth.hasToken) {
+        await _registerIfNeeded();
+      }
+      final refreshed = _auth;
+      if (refreshed == null) return;
+
+      await api.heartbeat(
+        deviceId: refreshed.deviceId,
+        currentRevision: currentRevision,
+        nowPlaying: _nowPlaying,
+        token: refreshed.token,
+      );
+    } on ApiException catch (e) {
+      if (e.statusCode == 404) {
+        await AppLogger.log('heartbeat 404 → re-register');
+        await _registerIfNeeded(force: true);
+        final refreshed = _auth;
+        if (refreshed == null) return;
+        try {
+          await api.heartbeat(
+            deviceId: refreshed.deviceId,
+            currentRevision: currentRevision,
+            nowPlaying: _nowPlaying,
+            token: refreshed.token,
+          );
+          return;
+        } catch (err) {
+          await AppLogger.log('heartbeat retry failed: $err');
+          return;
+        }
+      }
+      await AppLogger.log('heartbeat failed: $e');
+    } catch (e) {
+      await AppLogger.log('heartbeat failed: $e');
+    }
+  }
+
+  ManifestItem? currentSlot(DateTime now) {
+    final manifest = _manifest;
+    if (manifest == null) return null;
+    final active = manifest.items.where((i) => i.isActiveAt(now)).toList();
+    if (active.isEmpty) return null;
+    active.sort((a, b) {
+      final prio = b.priority.compareTo(a.priority);
+      if (prio != 0) return prio;
+      return b.startTime.compareTo(a.startTime);
+    });
     return active.first;
+  }
+
+  ManifestMedia? mediaById(int id) => _manifest?.mediaById(id);
+  ManifestPlaylist? playlistById(int id) => _manifest?.playlistById(id);
+
+  Future<File?> ensureMediaFile(ManifestMedia media) => _cache.ensureMediaFile(media, _mediaRoot);
+
+  String _deviceName() {
+    if (kIsWeb) return 'web';
+    return Platform.localHostname;
+  }
+
+  String _generateDeviceId() {
+    final rand = Random.secure();
+    final bytes = List<int>.generate(10, (_) => rand.nextInt(256));
+    final token = base64Url.encode(bytes).replaceAll('=', '');
+    return 'dev_${DateTime.now().millisecondsSinceEpoch}_$token';
   }
 }
