@@ -17,7 +17,20 @@ import '../models/playlist_item.dart';
 import '../services/config_service.dart';
 
 enum _Mode { image, video, black }
+
 enum _PlaybackContext { slotMedia, playlistItem }
+
+class _PreparedVideo {
+  const _PreparedVideo({
+    required this.playerIndex,
+    required this.source,
+    required this.mediaId,
+  });
+
+  final int playerIndex;
+  final String source;
+  final int mediaId;
+}
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key});
@@ -27,11 +40,13 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  late final Player _player;
-  late final VideoController _videoController;
+  late final List<Player> _players;
+  late final List<VideoController> _videoControllers;
+  int _activeVideoIndex = 0;
+  _PreparedVideo? _preparedVideo;
 
   // ===== ДОБАВЛЕНО: поддержка редактора =====
-  bool _isEditorOpen = false;   // Отслеживает открыт ли редактор
+  bool _isEditorOpen = false; // Отслеживает открыт ли редактор
   bool _showEditorButton = false; // Состояние видимости кнопки
   // ==========================================
 
@@ -60,6 +75,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // debug overlay
   bool _debug = true; // можешь поставить false по умолчанию
 
+  VideoController get _activeVideoController =>
+      _videoControllers[_activeVideoIndex];
+  int get _standbyVideoIndex => _activeVideoIndex == 0 ? 1 : 0;
+  Player get _standbyPlayer => _players[_standbyVideoIndex];
+
   Widget _buildImageView() {
     final imageKey = ValueKey(_imagePath);
     if (_imageIsFile) {
@@ -70,7 +90,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
         gaplessPlayback: true,
         filterQuality: FilterQuality.high,
         errorBuilder: (_, e, __) => const Center(
-          child: Text('Ошибка загрузки изображения (file)', style: TextStyle(color: Colors.white)),
+          child: Text(
+            'Ошибка загрузки изображения (file)',
+            style: TextStyle(color: Colors.white),
+          ),
         ),
       );
     }
@@ -81,7 +104,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       gaplessPlayback: true,
       filterQuality: FilterQuality.high,
       errorBuilder: (_, e, __) => const Center(
-        child: Text('Ошибка загрузки изображения (asset)', style: TextStyle(color: Colors.white)),
+        child: Text(
+          'Ошибка загрузки изображения (asset)',
+          style: TextStyle(color: Colors.white),
+        ),
       ),
     );
   }
@@ -90,19 +116,26 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void initState() {
     super.initState();
 
-    _player = Player();
-    _videoController = VideoController(_player);
+    _players = [Player(), Player()];
+    _videoControllers = _players
+        .map(VideoController.new)
+        .toList(growable: false);
 
-    _player.stream.error.listen((e) => unawaited(AppLogger.log('media_kit error: $e')));
+    for (var i = 0; i < _players.length; i++) {
+      _players[i].stream.error.listen(
+        (e) => unawaited(AppLogger.log('media_kit[$i] error: $e')),
+      );
 
-    _player.stream.completed.listen((_) {
-      if (_isDisposed) return;
-      if (!_expectVideoCompleted) return;
-      if (_mode != _Mode.video) return;
+      _players[i].stream.completed.listen((_) {
+        if (_isDisposed) return;
+        if (i != _activeVideoIndex) return;
+        if (!_expectVideoCompleted) return;
+        if (_mode != _Mode.video) return;
 
-      _expectVideoCompleted = false;
-      _onVideoCompleted();
-    });
+        _expectVideoCompleted = false;
+        _onVideoCompleted();
+      });
+    }
 
     // F12 — toggle debug overlay, F2 — открыть редактор
     HardwareKeyboard.instance.addHandler(_onKey);
@@ -164,7 +197,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _isEditorOpen = false;
 
     // Восстанавливаем таймер и применяем расписание
-    _tick = Timer.periodic(const Duration(seconds: 1), (_) => _applySchedule(force: true));
+    _tick?.cancel();
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) => _applySchedule());
     _applySchedule(force: true);
   }
   // ======================================================
@@ -180,7 +214,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
       await _applySchedule(force: true);
 
-      _tick = Timer.periodic(const Duration(seconds: 1), (_) => _applySchedule());
+      _tick = Timer.periodic(
+        const Duration(seconds: 1),
+        (_) => _applySchedule(),
+      );
       _debugTimer = Timer.periodic(const Duration(seconds: 1), (_) {
         if (_isDisposed || !_debug) return;
         setState(() {});
@@ -192,7 +229,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _applySchedule({bool force = false}) async {
-    if (_isDisposed) return;
+    if (_isDisposed || _isEditorOpen) return;
 
     final controller = Get.find<PlaylistController>();
     final now = DateTime.now();
@@ -247,7 +284,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
         setState(() => _mode = _Mode.black);
         return;
       }
-      await _playMedia(media, context: _PlaybackContext.slotMedia, slotContext: nextSlot);
+      await _playMedia(
+        media,
+        context: _PlaybackContext.slotMedia,
+        slotContext: nextSlot,
+      );
       return;
     }
 
@@ -262,11 +303,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await _playPlaylistIndex(0);
   }
 
-// ===== НОВЫЙ МЕТОД: обработка оффлайн-режима =====
-  Future<void> _applyOfflineSchedule(DateTime now, PlaylistController controller, bool force) async {
-    final nextItem = controller.localItems.firstWhereOrNull(
-          (item) => item.startDate.isBefore(now) && (item.stopDate == null || now.isBefore(item.stopDate!)),
-    );
+  // ===== НОВЫЙ МЕТОД: обработка оффлайн-режима =====
+  Future<void> _applyOfflineSchedule(
+    DateTime now,
+    PlaylistController controller,
+    bool force,
+  ) async {
+    final nextItem = controller.currentOfflineItem(now);
 
     if (nextItem == null) {
       if (_currentSlot != null || _currentMedia != null) {
@@ -284,7 +327,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     // Проверяем, тот же ли элемент
-    final same = !force && _currentSlot == null && _currentMedia == null && _lastOfflineItem != null &&
+    final same =
+        !force &&
+        _currentSlot == null &&
+        _currentMedia == null &&
+        _lastOfflineItem != null &&
         _lastOfflineItem!.filename == nextItem.filename &&
         _lastOfflineItem!.startDate == nextItem.startDate &&
         _lastOfflineItem!.stopDate == nextItem.stopDate;
@@ -321,6 +368,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final mediaRoot = cfg.mediaRoot;
 
     if (item.isImage) {
+      await _stopEverything();
       final diskPath = await _getLocalMediaPath(mediaRoot, item.filename);
       setState(() {
         _mode = _Mode.image;
@@ -331,9 +379,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       // Если не зациклено, ставим таймер на длительность показа
       if (!item.loop) {
         final now = DateTime.now();
-        final left = item.stopDate == null ? null : item.stopDate!.difference(now);
+        final left = item.stopDate?.difference(now);
         final showFor = Duration(seconds: item.durationSeconds);
-        final dur = (left == null) ? showFor : (showFor < left ? showFor : left);
+        final dur = (left == null)
+            ? showFor
+            : (showFor < left ? showFor : left);
 
         _imageTimer = Timer(dur, () {
           if (_isDisposed || !controller.isOfflineMode.value) return;
@@ -341,25 +391,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
         });
       }
 
-      await AppLogger.log('OFFLINE: SHOW IMAGE: ${item.filename} (loop=${item.loop})');
+      await AppLogger.log(
+        'OFFLINE: SHOW IMAGE: ${item.filename} (loop=${item.loop})',
+      );
       return;
     }
 
     if (item.isVideo) {
-      setState(() => _mode = _Mode.video);
-
       final diskPath = await _getLocalMediaPath(mediaRoot, item.filename);
       final src = diskPath ?? 'asset:///assets/media/${item.filename}';
 
       try {
-        await _player.setVolume(100);
-        await _player.open(Playlist([Media(src)]), play: true);
-        _expectVideoCompleted = true;
+        setState(() => _mode = _Mode.video);
+        await _playVideoSource(src, loopSingle: item.loop);
 
-        await AppLogger.log('OFFLINE: PLAY VIDEO: ${item.filename} src=$src (loop=${item.loop})');
+        await AppLogger.log(
+          'OFFLINE: PLAY VIDEO: ${item.filename} src=$src (loop=${item.loop})',
+        );
       } catch (e) {
         _expectVideoCompleted = false;
-        await AppLogger.log('OFFLINE: VIDEO OPEN FAILED: ${item.filename} error=$e');
+        await AppLogger.log(
+          'OFFLINE: VIDEO OPEN FAILED: ${item.filename} error=$e',
+        );
         setState(() => _mode = _Mode.black);
       }
       return;
@@ -384,28 +437,131 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final f = File(full);
     return (await f.exists()) ? f.path : null;
   }
-// ===== КОНЕЦ НОВОГО МЕТОДА =====
+  // ===== КОНЕЦ НОВОГО МЕТОДА =====
+
+  Future<void> _clearPreparedVideo() async {
+    _preparedVideo = null;
+    try {
+      await _standbyPlayer.pause();
+      await _standbyPlayer.setPlaylistMode(PlaylistMode.none);
+      await _standbyPlayer.setVolume(0);
+      await _standbyPlayer.stop();
+    } catch (_) {}
+  }
+
+  Future<void> _openVideoOnPlayer(
+    int playerIndex,
+    String source, {
+    required bool play,
+    required PlaylistMode playlistMode,
+  }) async {
+    final player = _players[playerIndex];
+    await player.setPlaylistMode(playlistMode);
+    await player.setVolume(play ? 100 : 0);
+    await player.open(Playlist([Media(source)]), play: play);
+    if (!play) {
+      await player.seek(Duration.zero);
+      await player.pause();
+    }
+  }
+
+  Future<bool> _activatePreparedVideoIfMatches(
+    String source, {
+    required bool loopSingle,
+  }) async {
+    final prepared = _preparedVideo;
+    if (prepared == null || prepared.source != source) {
+      return false;
+    }
+
+    final previousActive = _activeVideoIndex;
+    _activeVideoIndex = prepared.playerIndex;
+    _preparedVideo = null;
+
+    await _players[_activeVideoIndex].setPlaylistMode(
+      loopSingle ? PlaylistMode.single : PlaylistMode.none,
+    );
+    await _players[_activeVideoIndex].setVolume(100);
+    await _players[_activeVideoIndex].play();
+
+    try {
+      await _players[previousActive].pause();
+      await _players[previousActive].setVolume(0);
+      await _players[previousActive].stop();
+    } catch (_) {}
+
+    _expectVideoCompleted = !loopSingle;
+    if (mounted) {
+      setState(() => _mode = _Mode.video);
+    }
+    return true;
+  }
+
+  Future<void> _playVideoSource(
+    String source, {
+    required bool loopSingle,
+  }) async {
+    final activated = await _activatePreparedVideoIfMatches(
+      source,
+      loopSingle: loopSingle,
+    );
+    if (activated) {
+      return;
+    }
+
+    await _clearPreparedVideo();
+    await _openVideoOnPlayer(
+      _activeVideoIndex,
+      source,
+      play: true,
+      playlistMode: loopSingle ? PlaylistMode.single : PlaylistMode.none,
+    );
+    _expectVideoCompleted = !loopSingle;
+  }
+
+  Future<void> _prepareVideoOnStandby(String source, int mediaId) async {
+    final prepared = _preparedVideo;
+    if (prepared != null && prepared.source == source) {
+      return;
+    }
+
+    await _clearPreparedVideo();
+    await _openVideoOnPlayer(
+      _standbyVideoIndex,
+      source,
+      play: false,
+      playlistMode: PlaylistMode.none,
+    );
+    _preparedVideo = _PreparedVideo(
+      playerIndex: _standbyVideoIndex,
+      source: source,
+      mediaId: mediaId,
+    );
+  }
 
   Future<void> _stopEverything() async {
     _imageTimer?.cancel();
     _expectVideoCompleted = false;
-    try {
-      await _player.pause();
-      await _player.setVolume(0);
-      await _player.stop();
-    } catch (_) {}
+    _preparedVideo = null;
+    for (final player in _players) {
+      try {
+        await player.pause();
+        await player.setPlaylistMode(PlaylistMode.none);
+        await player.setVolume(0);
+        await player.stop();
+      } catch (_) {}
+    }
   }
 
   Future<void> _playMedia(
-      ManifestMedia media, {
-        required _PlaybackContext context,
-        required ManifestItem slotContext,
-      }) async {
-    await _stopEverything();
-
+    ManifestMedia media, {
+    required _PlaybackContext context,
+    required ManifestItem slotContext,
+  }) async {
     final controller = Get.find<PlaylistController>();
     final file = await controller.ensureMediaFile(media);
     if (file == null) {
+      await _stopEverything();
       setState(() => _mode = _Mode.black);
       return;
     }
@@ -415,6 +571,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _currentMedia = media;
 
     if (media.isImage) {
+      await _stopEverything();
       setState(() {
         _mode = _Mode.image;
         _imageIsFile = true;
@@ -430,16 +587,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     if (media.isVideo) {
-      setState(() => _mode = _Mode.video);
-
       try {
-        await _player.setVolume(100);
-        await _player.open(Playlist([Media(file.path)]), play: true);
-        _expectVideoCompleted = true;
-        await AppLogger.log('PLAY VIDEO: ${media.safeBaseName} src=${file.path}');
+        setState(() => _mode = _Mode.video);
+        await _playVideoSource(
+          file.path,
+          loopSingle:
+              context == _PlaybackContext.slotMedia &&
+              slotContext.loopMode == ManifestLoopMode.fill,
+        );
+        await AppLogger.log(
+          'PLAY VIDEO: ${media.safeBaseName} src=${file.path}',
+        );
       } catch (e) {
         _expectVideoCompleted = false;
-        await AppLogger.log('VIDEO OPEN FAILED: ${media.safeBaseName} error=$e');
+        await AppLogger.log(
+          'VIDEO OPEN FAILED: ${media.safeBaseName} error=$e',
+        );
         setState(() => _mode = _Mode.black);
       }
       return;
@@ -487,7 +650,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
       // Если зациклен и ещё в пределах времени - перезапускаем
       final now = DateTime.now();
-      final stillInWindow = item.stopDate == null ? true : now.isBefore(item.stopDate!);
+      final stillInWindow = item.stopDate == null
+          ? true
+          : now.isBefore(item.stopDate!);
       if (stillInWindow) {
         await _playOfflineItem(item);
       } else {
@@ -507,16 +672,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final media = _currentMedia;
     if (slot == null || media == null) return;
 
-    if (slot.loopMode == ManifestLoopMode.fill && slot.isActiveAt(DateTime.now())) {
-      try {
-        _expectVideoCompleted = true;
-        await _player.seek(Duration.zero);
-        await _player.play();
-        return;
-      } catch (_) {
-        await _playMedia(media, context: _PlaybackContext.slotMedia, slotContext: slot);
-        return;
-      }
+    if (slot.loopMode == ManifestLoopMode.fill &&
+        slot.isActiveAt(DateTime.now())) {
+      await _playMedia(
+        media,
+        context: _PlaybackContext.slotMedia,
+        slotContext: slot,
+      );
+      return;
     }
     setState(() => _mode = _Mode.black);
   }
@@ -539,8 +702,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _currentPlaylistItem = item;
       final slot = _currentSlot;
       if (slot == null) return;
-      await _playMedia(media, context: _PlaybackContext.playlistItem, slotContext: slot);
-      _precacheNextPlaylistImage(playlist, i);
+      await _playMedia(
+        media,
+        context: _PlaybackContext.playlistItem,
+        slotContext: slot,
+      );
+      _prepareUpcomingPlayback(playlist, i);
       return;
     }
 
@@ -558,7 +725,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final now = DateTime.now();
 
       // Если элемент ещё активен и зациклен - перезапускаем
-      if (item.loop && (item.stopDate == null || now.isBefore(item.stopDate!))) {
+      if (item.loop &&
+          (item.stopDate == null || now.isBefore(item.stopDate!))) {
         _playOfflineItem(item);
       } else {
         // Иначе переходим к следующему элементу или чёрному экрану
@@ -590,18 +758,50 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _playPlaylistIndex(nextIndex);
   }
 
-  Future<void> _precacheNextPlaylistImage(ManifestPlaylist playlist, int fromIndex) async {
+  Future<void> _prepareUpcomingPlayback(
+    ManifestPlaylist playlist,
+    int fromIndex,
+  ) async {
     if (!mounted) return;
     final controller = Get.find<PlaylistController>();
-    for (int i = fromIndex + 1; i < playlist.items.length; i++) {
-      final item = playlist.items[i];
-      final media = controller.mediaById(item.mediaId);
-      if (media == null || !media.isImage) continue;
+    final slot = _currentSlot;
+    if (slot == null) return;
+
+    var nextIndex = fromIndex + 1;
+    if (nextIndex >= playlist.items.length) {
+      if (slot.loopMode != ManifestLoopMode.fill) {
+        await _clearPreparedVideo();
+        return;
+      }
+      nextIndex = 0;
+    }
+
+    final item = playlist.items[nextIndex];
+    final media = controller.mediaById(item.mediaId);
+    if (media == null) {
+      await _clearPreparedVideo();
+      return;
+    }
+
+    if (media.isImage) {
+      await _clearPreparedVideo();
       final file = await controller.ensureMediaFile(media);
       if (file == null || !mounted) return;
       await precacheImage(FileImage(file), context);
       return;
     }
+
+    if (media.isVideo) {
+      final file = await controller.ensureMediaFile(media);
+      if (file == null) {
+        await _clearPreparedVideo();
+        return;
+      }
+      await _prepareVideoOnStandby(file.path, media.id);
+      return;
+    }
+
+    await _clearPreparedVideo();
   }
 
   @override
@@ -625,12 +825,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: _mode == _Mode.image && _imagePath.isNotEmpty
                 ? _buildImageView()
                 : _mode == _Mode.video
-                ? Video(controller: _videoController, fit: BoxFit.contain)
+                ? Video(
+                    key: ValueKey('video-$_activeVideoIndex'),
+                    controller: _activeVideoController,
+                    fit: BoxFit.contain,
+                  )
                 : const SizedBox.shrink(),
           ),
 
           // ===== ДОБАВЛЕНО: кнопка редактора при наведении мыши =====
-// Новый исправленный код:
+          // Новый исправленный код:
           Positioned(
             top: 0,
             left: 0,
@@ -653,36 +857,43 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         onPressed: _openEditor,
                         backgroundColor: Colors.red.shade700,
                         elevation: 8,
-                        child: const Icon(Icons.edit, size: 30, color: Colors.white),
                         tooltip: 'Открыть редактор (F2)',
+                        child: const Icon(
+                          Icons.edit,
+                          size: 30,
+                          color: Colors.white,
+                        ),
                       ),
                     ),
                 ],
               ),
             ),
           ),
-          // ============================================================
 
+          // ============================================================
           if (_debug)
             Positioned(
               left: 12,
               bottom: 12,
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 8,
+                ),
                 color: Colors.black54,
                 child: Text(
                   'now=${DateTime.now()}\n'
-                      'mode=$_mode\n'
-                      'slot=${slot == null ? "-" : slot.contentType.name}:${slot?.contentId}\n'
-                      'start=${slot?.startTime}\n'
-                      'stop=${slot?.endTime}\n'
-                      'loop=${slot?.loopMode.name}\n'
-                      'priority=${slot?.priority}\n'
-                      'playlistIndex=$_playlistIndex\n'
-                      'media=${_currentMedia?.id ?? "-"}\n'
-                      'expectCompleted=$_expectVideoCompleted\n'
-                      'imgIsFile=$_imageIsFile\n'
-                      'imgPath=$_imagePath',
+                  'mode=$_mode\n'
+                  'slot=${slot == null ? "-" : slot.contentType.name}:${slot?.contentId}\n'
+                  'start=${slot?.startTime}\n'
+                  'stop=${slot?.endTime}\n'
+                  'loop=${slot?.loopMode.name}\n'
+                  'priority=${slot?.priority}\n'
+                  'playlistIndex=$_playlistIndex\n'
+                  'media=${_currentMedia?.id ?? "-"}\n'
+                  'expectCompleted=$_expectVideoCompleted\n'
+                  'imgIsFile=$_imageIsFile\n'
+                  'imgPath=$_imagePath',
                   style: const TextStyle(color: Colors.white70, fontSize: 12),
                 ),
               ),
@@ -700,7 +911,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _imageTimer?.cancel();
     _debugTimer?.cancel();
     HardwareKeyboard.instance.removeHandler(_onKey);
-    _player.dispose();
+    for (final player in _players) {
+      player.dispose();
+    }
     super.dispose();
   }
 }

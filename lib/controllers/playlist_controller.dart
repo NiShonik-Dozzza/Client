@@ -49,6 +49,15 @@ class PlaylistController extends GetxController {
   Manifest? get manifest => _manifest;
   String get currentRevision => _manifest?.revision ?? '';
   List<ManifestItem> get items => _manifest?.items ?? [];
+  List<PlaylistItem> get editorItems => localItems.toList();
+  PlaylistItem? currentOfflineItem(DateTime now) {
+    for (final item in localItems.reversed) {
+      if (item.isActiveAt(now)) {
+        return item;
+      }
+    }
+    return null;
+  }
 
   @override
   void onInit() {
@@ -72,7 +81,11 @@ class PlaylistController extends GetxController {
       _cache = MediaCacheService(onForbidden: _fetchManifest);
 
       _auth = await _deviceStore.read();
-      _auth ??= DeviceAuth(deviceId: _generateDeviceId(), token: '', name: _deviceName());
+      _auth ??= DeviceAuth(
+        deviceId: _generateDeviceId(),
+        token: '',
+        name: _deviceName(),
+      );
       await _deviceStore.save(_auth!);
 
       await _registerIfNeeded();
@@ -87,7 +100,10 @@ class PlaylistController extends GetxController {
 
       await _fetchManifest();
 
-      _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) => _sendHeartbeat());
+      _heartbeatTimer = Timer.periodic(
+        _heartbeatInterval,
+        (_) => _sendHeartbeat(),
+      );
     } catch (e) {
       await AppLogger.log('boot error: $e');
       // Даже при ошибке загружаем локальный плейлист для аварийного режима
@@ -103,39 +119,59 @@ class PlaylistController extends GetxController {
       final file = await AppPaths.playlistFile();
       if (await file.exists()) {
         final json = jsonDecode(await file.readAsString());
-        localItems.assignAll((json as List).map((e) => PlaylistItem.fromJson(e)).toList());
-        await AppLogger.log('Local playlist loaded: ${localItems.length} items');
+        localItems.assignAll(
+          _normalizeLocalItems(
+            (json as List).map((e) => PlaylistItem.fromJson(e)).toList(),
+          ),
+        );
+        await AppLogger.log(
+          'Local playlist loaded: ${localItems.length} items',
+        );
       } else {
-        // Создаём заглушку-плейлист если файла нет
-        localItems.assignAll([
-          PlaylistItem(
-            filename: 'emergency.mp4',
-            startDate: DateTime.now(),
-            stopDate: DateTime.now().add(const Duration(hours: 24)),
-            loop: true,
-            durationSeconds: 10,
-          )
-        ]);
-        await _saveLocalPlaylist(); // Сохраняем заглушку
-        await AppLogger.log('Created emergency playlist stub');
+        localItems.clear();
+        await AppLogger.log('Local playlist file not found, using empty list');
       }
     } catch (e) {
       await AppLogger.log('Local playlist load error: $e');
-      // Всегда обеспечиваем наличие хотя бы одного элемента
-      if (localItems.isEmpty) {
-        localItems.add(PlaylistItem(
-          filename: 'emergency.mp4',
-          startDate: DateTime.now(),
-          stopDate: DateTime.now().add(const Duration(hours: 24)),
-          loop: true,
-          durationSeconds: 10,
-        ));
-      }
+      localItems.clear();
     }
   }
 
-  Future<void> saveLocalPlaylist() async {
+  List<PlaylistItem> _normalizeLocalItems(List<PlaylistItem> items) {
+    final normalized =
+        items
+            .where((item) => item.filename.trim().isNotEmpty)
+            .map(
+              (item) => item.copyWith(
+                filename: item.filename.trim(),
+                durationSeconds: item.durationSeconds < 1
+                    ? 1
+                    : item.durationSeconds,
+              ),
+            )
+            .toList()
+          ..sort((a, b) => a.startDate.compareTo(b.startDate));
+    return normalized;
+  }
+
+  Future<void> refreshLocalPlaylist() async {
+    await _loadLocalPlaylist();
+    version.value++;
+  }
+
+  Future<void> replaceLocalPlaylist(List<PlaylistItem> items) async {
+    localItems.assignAll(_normalizeLocalItems(items));
+    version.value++;
+  }
+
+  Future<void> saveLocalPlaylist([List<PlaylistItem>? items]) async {
+    if (items != null) {
+      await replaceLocalPlaylist(items);
+    }
     await _saveLocalPlaylist();
+    if (items == null) {
+      version.value++;
+    }
   }
 
   Future<void> _saveLocalPlaylist() async {
@@ -154,28 +190,41 @@ class PlaylistController extends GetxController {
   /// Получает текущий элемент для воспроизведения (с учётом режима)
   dynamic currentItem(DateTime now) {
     if (isOfflineMode.value) {
-      // Оффлайн-режим: ищем активный элемент в локальном плейлисте
-      return localItems.firstWhereOrNull(
-            (item) => item.startDate.isBefore(now) && (item.stopDate == null || now.isBefore(item.stopDate!)),
-      );
+      // Оффлайн-режим: при пересечении окон берём последний начавшийся элемент.
+      return currentOfflineItem(now);
     } else {
       // Онлайн-режим: используем манифест
       return currentSlot(now);
     }
   }
 
-  /// Совместимость для редактора: возвращает локальные элементы в оффлайн-режиме
-  List<PlaylistItem> get editorItems => isOfflineMode.value ? localItems.toList() : [];
-
   /// Совместимость: заглушка для онлайн-режима, в оффлайн-режиме перезагружает локальный плейлист
   Future<void> loadPlaylist() async {
     if (isOfflineMode.value) {
-      await _loadLocalPlaylist();
+      await refreshLocalPlaylist();
     } else {
       await _fetchManifest();
     }
   }
   // ===== КОНЕЦ ЛОКАЛЬНОГО РЕЖИМА =====
+
+  Future<void> enableOfflineMode() async {
+    if (isOfflineMode.value) return;
+    await _loadLocalPlaylist();
+    _manifestTimer?.cancel();
+    isOfflineMode.value = true;
+    version.value++;
+    await AppLogger.log('Offline emergency mode enabled');
+  }
+
+  Future<void> disableOfflineMode() async {
+    if (!isOfflineMode.value) return;
+    isOfflineMode.value = false;
+    version.value++;
+    await AppLogger.log('Offline emergency mode disabled');
+    await _fetchManifest();
+    unawaited(_sendHeartbeat());
+  }
 
   Future<void> _registerIfNeeded({bool force = false}) async {
     final api = _api;
@@ -184,8 +233,15 @@ class PlaylistController extends GetxController {
     if (auth.hasToken && !force) return;
 
     try {
-      final registered = await api.register(deviceId: auth.deviceId, name: auth.name ?? _deviceName());
-      _auth = DeviceAuth(deviceId: registered.deviceId, token: registered.token, name: auth.name ?? registered.name);
+      final registered = await api.register(
+        deviceId: auth.deviceId,
+        name: auth.name ?? _deviceName(),
+      );
+      _auth = DeviceAuth(
+        deviceId: registered.deviceId,
+        token: registered.token,
+        name: auth.name ?? registered.name,
+      );
       await _deviceStore.save(_auth!);
       await AppLogger.log('registered device_id=${_auth!.deviceId}');
     } catch (e) {
@@ -210,7 +266,10 @@ class PlaylistController extends GetxController {
       final refreshed = _auth;
       if (refreshed == null) return;
 
-      final manifest = await api.fetchManifest(deviceId: refreshed.deviceId, token: refreshed.token);
+      final manifest = await api.fetchManifest(
+        deviceId: refreshed.deviceId,
+        token: refreshed.token,
+      );
       _manifestFailures = 0;
       if (_manifest?.revision == manifest.revision) return;
 
@@ -229,7 +288,11 @@ class PlaylistController extends GetxController {
   void _setManifest(Manifest manifest, {required String source}) {
     _manifest = manifest;
     version.value++;
-    unawaited(AppLogger.log('Manifest updated ($source): rev=${manifest.revision} items=${manifest.items.length}'));
+    unawaited(
+      AppLogger.log(
+        'Manifest updated ($source): rev=${manifest.revision} items=${manifest.items.length}',
+      ),
+    );
   }
 
   void _prefetchMedia(Manifest manifest) {
@@ -275,7 +338,9 @@ class PlaylistController extends GetxController {
     if (isOfflineMode.value) return; // В оффлайн-режиме не планируем опрос
 
     _manifestTimer?.cancel();
-    final delay = _manifestFailures == 0 ? _manifestBaseInterval : _backoffDelay(_manifestFailures);
+    final delay = _manifestFailures == 0
+        ? _manifestBaseInterval
+        : _backoffDelay(_manifestFailures);
     _manifestTimer = Timer(delay, _fetchManifest);
   }
 
@@ -352,7 +417,8 @@ class PlaylistController extends GetxController {
   ManifestMedia? mediaById(int id) => _manifest?.mediaById(id);
   ManifestPlaylist? playlistById(int id) => _manifest?.playlistById(id);
 
-  Future<File?> ensureMediaFile(ManifestMedia media) => _cache.ensureMediaFile(media, _mediaRoot);
+  Future<File?> ensureMediaFile(ManifestMedia media) =>
+      _cache.ensureMediaFile(media, _mediaRoot);
 
   String _deviceName() {
     if (kIsWeb) return 'web';

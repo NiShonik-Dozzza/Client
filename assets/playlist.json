@@ -1,9 +1,0 @@
-[
-  {
-    "filename": "emergency.mp4",
-    "startDate": "2024-01-01T00:00:00",
-    "stopDate": "2030-12-31T23:59:59",
-    "loop": true,
-    "durationSeconds": 10
-  }
-]

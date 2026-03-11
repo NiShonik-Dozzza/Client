@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'app_paths.dart';
 import 'app_logger.dart';
@@ -10,7 +9,10 @@ class AppConfig {
 
   AppConfig({required this.mediaRoot, required this.apiBase});
 
-  Map<String, dynamic> toJson() => {'media_root': mediaRoot, 'api_base': apiBase};
+  Map<String, dynamic> toJson() => {
+    'media_root': mediaRoot,
+    'api_base': apiBase,
+  };
 
   static AppConfig defaults(String docsMediaDir) {
     return AppConfig(
@@ -41,11 +43,17 @@ class ConfigService {
       final mediaRoot = (map['media_root'] as String?)?.trim();
       final apiBase = (map['api_base'] as String?)?.trim();
       final cfg = AppConfig(
-        mediaRoot: (mediaRoot == null || mediaRoot.isEmpty) ? defaultConfig.mediaRoot : mediaRoot,
-        apiBase: (apiBase == null || apiBase.isEmpty) ? defaultConfig.apiBase : apiBase,
+        mediaRoot: (mediaRoot == null || mediaRoot.isEmpty)
+            ? defaultConfig.mediaRoot
+            : mediaRoot,
+        apiBase: (apiBase == null || apiBase.isEmpty)
+            ? defaultConfig.apiBase
+            : apiBase,
       );
       _cached = cfg;
-      await AppLogger.log('Config loaded: media_root=${cfg.mediaRoot} api_base=${cfg.apiBase}');
+      await AppLogger.log(
+        'Config loaded: media_root=${cfg.mediaRoot} api_base=${cfg.apiBase}',
+      );
       return cfg;
     } catch (e) {
       _cached = defaultConfig;
@@ -56,7 +64,10 @@ class ConfigService {
 
   Future<void> setMediaRoot(String newRoot) async {
     final file = await AppPaths.configFile();
-    final cfg = AppConfig(mediaRoot: newRoot, apiBase: _cached?.apiBase ?? AppConfig.defaults(newRoot).apiBase);
+    final cfg = AppConfig(
+      mediaRoot: newRoot,
+      apiBase: _cached?.apiBase ?? AppConfig.defaults(newRoot).apiBase,
+    );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
     await AppLogger.log('Config updated: media_root=$newRoot');
@@ -64,7 +75,10 @@ class ConfigService {
 
   Future<void> setApiBase(String newBase) async {
     final file = await AppPaths.configFile();
-    final cfg = AppConfig(mediaRoot: _cached?.mediaRoot ?? (await AppPaths.mediaDir()).path, apiBase: newBase);
+    final cfg = AppConfig(
+      mediaRoot: _cached?.mediaRoot ?? (await AppPaths.mediaDir()).path,
+      apiBase: newBase,
+    );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
     await AppLogger.log('Config updated: api_base=$newBase');

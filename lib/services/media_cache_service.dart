@@ -15,8 +15,8 @@ class DownloadForbidden implements Exception {
 
 class MediaCacheService {
   MediaCacheService({http.Client? client, Future<void> Function()? onForbidden})
-      : _client = client ?? http.Client(),
-        _onForbidden = onForbidden;
+    : _client = client ?? http.Client(),
+      _onForbidden = onForbidden;
 
   final http.Client _client;
   final Map<int, Future<File?>> _inflight = {};
@@ -44,11 +44,13 @@ class MediaCacheService {
             throw Exception('download failed: checksum mismatch');
           } on DownloadForbidden {
             if (!refreshed && _onForbidden != null) {
-              await _onForbidden!();
+              await _onForbidden();
               refreshed = true;
             }
           } catch (e) {
-            await AppLogger.log('Media download attempt ${attempt + 1} failed: $e');
+            await AppLogger.log(
+              'Media download attempt ${attempt + 1} failed: $e',
+            );
           }
 
           if (attempt < _maxDownloadAttempts - 1) {
@@ -112,7 +114,9 @@ class MediaCacheService {
 
     if (!await _isValid(temp, media)) {
       await temp.delete();
-      await AppLogger.log('Media checksum mismatch: id=${media.id} name=${media.safeBaseName}');
+      await AppLogger.log(
+        'Media checksum mismatch: id=${media.id} name=${media.safeBaseName}',
+      );
       return null;
     }
 
