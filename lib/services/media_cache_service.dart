@@ -14,13 +14,18 @@ class DownloadForbidden implements Exception {
 }
 
 class MediaCacheService {
-  MediaCacheService({http.Client? client, Future<void> Function()? onForbidden})
-    : _client = client ?? http.Client(),
-      _onForbidden = onForbidden;
+  MediaCacheService({
+    http.Client? client,
+    Future<void> Function()? onForbidden,
+    String? Function()? tokenProvider,
+  }) : _client = client ?? http.Client(),
+       _onForbidden = onForbidden,
+       _tokenProvider = tokenProvider;
 
   final http.Client _client;
   final Map<int, Future<File?>> _inflight = {};
   final Future<void> Function()? _onForbidden;
+  final String? Function()? _tokenProvider;
   final _rng = Random();
 
   static const List<int> _downloadBackoffSeconds = [2, 5, 10, 20, 30];
@@ -91,8 +96,15 @@ class MediaCacheService {
 
   Future<void> _download(String url, File target) async {
     final uri = Uri.parse(url);
-    final response = await _client.send(http.Request('GET', uri));
-    if (response.statusCode == 403) {
+    final request = http.Request('GET', uri);
+    final token = _tokenProvider?.call();
+    if (token != null && token.isNotEmpty) {
+      request.headers['Authorization'] = 'Bearer $token';
+    }
+    final response = await _client.send(request);
+    if (response.statusCode == 401 ||
+        response.statusCode == 403 ||
+        response.statusCode == 404) {
       throw DownloadForbidden();
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {

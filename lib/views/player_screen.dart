@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
+import 'package:intl/intl.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
@@ -40,6 +41,8 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
+  static final DateFormat _debugTimeFormat = DateFormat('yyyy-MM-dd HH:mm:ss');
+
   late final List<Player> _players;
   late final List<VideoController> _videoControllers;
   int _activeVideoIndex = 0;
@@ -73,7 +76,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _expectVideoCompleted = false;
 
   // debug overlay
-  bool _debug = true; // можешь поставить false по умолчанию
+  bool _debug = false; // скрыт по умолчанию
 
   VideoController get _activeVideoController =>
       _videoControllers[_activeVideoIndex];
@@ -83,30 +86,34 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Widget _buildImageView() {
     final imageKey = ValueKey(_imagePath);
     if (_imageIsFile) {
-      return Image.file(
-        File(_imagePath),
-        key: imageKey,
-        fit: BoxFit.contain,
-        gaplessPlayback: true,
-        filterQuality: FilterQuality.high,
-        errorBuilder: (_, e, __) => const Center(
-          child: Text(
-            'Ошибка загрузки изображения (file)',
-            style: TextStyle(color: Colors.white),
+      return SizedBox.expand(
+        child: Image.file(
+          File(_imagePath),
+          key: imageKey,
+          fit: BoxFit.contain,
+          gaplessPlayback: true,
+          filterQuality: FilterQuality.medium,
+          errorBuilder: (_, e, __) => const Center(
+            child: Text(
+              'Ошибка загрузки изображения (file)',
+              style: TextStyle(color: Colors.white),
+            ),
           ),
         ),
       );
     }
-    return Image.asset(
-      _imagePath,
-      key: imageKey,
-      fit: BoxFit.contain,
-      gaplessPlayback: true,
-      filterQuality: FilterQuality.high,
-      errorBuilder: (_, e, __) => const Center(
-        child: Text(
-          'Ошибка загрузки изображения (asset)',
-          style: TextStyle(color: Colors.white),
+    return SizedBox.expand(
+      child: Image.asset(
+        _imagePath,
+        key: imageKey,
+        fit: BoxFit.contain,
+        gaplessPlayback: true,
+        filterQuality: FilterQuality.medium,
+        errorBuilder: (_, e, __) => const Center(
+          child: Text(
+            'Ошибка загрузки изображения (asset)',
+            style: TextStyle(color: Colors.white),
+          ),
         ),
       ),
     );
@@ -822,13 +829,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
         children: [
           AnimatedSwitcher(
             duration: const Duration(milliseconds: 200),
+            layoutBuilder: (currentChild, previousChildren) => Stack(
+              fit: StackFit.expand,
+              children: [
+                ...previousChildren,
+                if (currentChild != null) currentChild,
+              ],
+            ),
             child: _mode == _Mode.image && _imagePath.isNotEmpty
                 ? _buildImageView()
                 : _mode == _Mode.video
-                ? Video(
-                    key: ValueKey('video-$_activeVideoIndex'),
-                    controller: _activeVideoController,
-                    fit: BoxFit.contain,
+                ? SizedBox.expand(
+                    child: Video(
+                      key: ValueKey('video-$_activeVideoIndex'),
+                      controller: _activeVideoController,
+                      fit: BoxFit.contain,
+                    ),
                   )
                 : const SizedBox.shrink(),
           ),
@@ -882,11 +898,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 ),
                 color: Colors.black54,
                 child: Text(
-                  'now=${DateTime.now()}\n'
+                  'now=${_formatDebugTime(DateTime.now())}\n'
                   'mode=$_mode\n'
                   'slot=${slot == null ? "-" : slot.contentType.name}:${slot?.contentId}\n'
-                  'start=${slot?.startTime}\n'
-                  'stop=${slot?.endTime}\n'
+                  'start=${_formatDebugTime(slot?.startTime)}\n'
+                  'stop=${_formatDebugTime(slot?.endTime)}\n'
                   'loop=${slot?.loopMode.name}\n'
                   'priority=${slot?.priority}\n'
                   'playlistIndex=$_playlistIndex\n'
@@ -916,6 +932,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     super.dispose();
   }
+}
+
+String _formatDebugTime(DateTime? value) {
+  if (value == null) return '-';
+  return _PlayerScreenState._debugTimeFormat.format(value.toLocal());
 }
 
 bool _isSameSlot(ManifestItem? a, ManifestItem b) {

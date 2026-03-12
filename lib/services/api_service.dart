@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../models/manifest.dart';
-import '../services/device_store.dart';
 
 class ApiException implements Exception {
   final int statusCode;
@@ -15,49 +14,142 @@ class ApiException implements Exception {
   String toString() => 'ApiException($statusCode): $body';
 }
 
+class DeviceHealth {
+  final bool ok;
+  final String name;
+  final String version;
+  final String timezone;
+
+  DeviceHealth({
+    required this.ok,
+    required this.name,
+    required this.version,
+    required this.timezone,
+  });
+
+  factory DeviceHealth.fromJson(Map<String, dynamic> json) {
+    return DeviceHealth(
+      ok: json['ok'] == true,
+      name: (json['name'] as String?)?.trim() ?? '',
+      version: (json['version'] as String?)?.trim() ?? '',
+      timezone: (json['timezone'] as String?)?.trim() ?? '',
+    );
+  }
+}
+
+class DeviceRegistrationRequestResult {
+  final String deviceId;
+  final String requestToken;
+  final int pollAfterSeconds;
+  final String message;
+
+  DeviceRegistrationRequestResult({
+    required this.deviceId,
+    required this.requestToken,
+    required this.pollAfterSeconds,
+    required this.message,
+  });
+
+  factory DeviceRegistrationRequestResult.fromJson(Map<String, dynamic> json) {
+    return DeviceRegistrationRequestResult(
+      deviceId: (json['device_id'] as String?)?.trim() ?? '',
+      requestToken: (json['request_token'] as String?)?.trim() ?? '',
+      pollAfterSeconds: _asInt(json['poll_after_seconds'], 5),
+      message: (json['message'] as String?)?.trim() ?? '',
+    );
+  }
+}
+
+class DeviceRegistrationStatus {
+  final String deviceId;
+  final String status;
+  final int pollAfterSeconds;
+  final String message;
+  final String? token;
+  final String? screenName;
+
+  DeviceRegistrationStatus({
+    required this.deviceId,
+    required this.status,
+    required this.pollAfterSeconds,
+    required this.message,
+    required this.token,
+    required this.screenName,
+  });
+
+  factory DeviceRegistrationStatus.fromJson(Map<String, dynamic> json) {
+    return DeviceRegistrationStatus(
+      deviceId: (json['device_id'] as String?)?.trim() ?? '',
+      status: (json['status'] as String?)?.trim().toLowerCase() ?? 'pending',
+      pollAfterSeconds: _asInt(json['poll_after_seconds'], 5),
+      message: (json['message'] as String?)?.trim() ?? '',
+      token: (json['token'] as String?)?.trim(),
+      screenName: (json['screen_name'] as String?)?.trim(),
+    );
+  }
+
+  bool get isApproved => status == 'approved';
+  bool get isRejected => status == 'rejected';
+}
+
 class ApiService {
-  ApiService({required String apiBase, http.Client? client})
-      : _apiBase = apiBase.trim(),
-        _client = client ?? http.Client();
+  ApiService({required String serverBase, http.Client? client})
+    : _serverBase = _normalizeServerBase(serverBase),
+      _client = client ?? http.Client();
 
   final http.Client _client;
-  String _apiBase;
+  String _serverBase;
 
-  void updateApiBase(String apiBase) {
-    _apiBase = apiBase.trim();
+  void updateServerBase(String serverBase) {
+    _serverBase = _normalizeServerBase(serverBase);
   }
 
-  Future<DeviceAuth> register({required String deviceId, String? name}) async {
-    final uri = _buildUri('/screens/register');
-    final payload = <String, dynamic>{
-      'device_id': deviceId,
-      if (name != null && name.trim().isNotEmpty) 'name': name.trim(),
-    };
+  Future<DeviceHealth> health() async {
+    final resp = await _client.get(_buildUri('/api/v1/device/health'));
+    return DeviceHealth.fromJson(_decodeMap(resp));
+  }
 
+  Future<DeviceRegistrationRequestResult> requestRegistration({
+    required String deviceId,
+    String? name,
+    String? clientVersion,
+  }) async {
     final resp = await _client.post(
-      uri,
+      _buildUri('/api/v1/device/register/request'),
       headers: _headers(),
-      body: jsonEncode(payload),
+      body: jsonEncode({
+        'device_id': deviceId,
+        if (name != null && name.trim().isNotEmpty) 'name': name.trim(),
+        if (clientVersion != null && clientVersion.trim().isNotEmpty)
+          'client_version': clientVersion.trim(),
+      }),
     );
-
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      throw ApiException(resp.statusCode, resp.body);
-    }
-
-    final map = jsonDecode(resp.body) as Map<String, dynamic>;
-    return DeviceAuth.fromJson(map);
+    return DeviceRegistrationRequestResult.fromJson(_decodeMap(resp));
   }
 
-  Future<Manifest> fetchManifest({required String deviceId, String? token}) async {
-    final uri = _buildUri('/manifest', {'device_id': deviceId});
-    final resp = await _client.get(uri, headers: _headers(token: token));
+  Future<DeviceRegistrationStatus> registrationStatus({
+    required String deviceId,
+    required String requestToken,
+  }) async {
+    final resp = await _client.get(
+      _buildUri('/api/v1/device/register/status', {
+        'device_id': deviceId,
+        'request_token': requestToken,
+      }),
+      headers: _headers(),
+    );
+    return DeviceRegistrationStatus.fromJson(_decodeMap(resp));
+  }
 
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      throw ApiException(resp.statusCode, resp.body);
-    }
-
-    final map = jsonDecode(resp.body) as Map<String, dynamic>;
-    return Manifest.fromJson(map);
+  Future<Manifest> fetchManifest({
+    required String deviceId,
+    String? token,
+  }) async {
+    final resp = await _client.get(
+      _buildUri('/api/v1/device/manifest', {'device_id': deviceId}),
+      headers: _headers(token: token),
+    );
+    return Manifest.fromJson(_decodeMap(resp));
   }
 
   Future<void> heartbeat({
@@ -66,29 +158,32 @@ class ApiService {
     required String? nowPlaying,
     String? token,
   }) async {
-    final uri = _buildUri('/screens/heartbeat');
-    final payload = <String, dynamic>{
-      'device_id': deviceId,
-      'current_revision_str': currentRevision,
-      'now_playing': nowPlaying ?? '',
-    };
-
     final resp = await _client.post(
-      uri,
+      _buildUri('/api/v1/device/heartbeat'),
       headers: _headers(token: token),
-      body: jsonEncode(payload),
+      body: jsonEncode({
+        'device_id': deviceId,
+        'current_revision_str': currentRevision,
+        'now_playing': nowPlaying ?? '',
+      }),
     );
-
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      throw ApiException(resp.statusCode, resp.body);
-    }
+    _decodeMap(resp);
   }
 
   Uri _buildUri(String path, [Map<String, String>? query]) {
-    final base = _apiBase.endsWith('/') ? _apiBase.substring(0, _apiBase.length - 1) : _apiBase;
-    final p = path.startsWith('/') ? path : '/$path';
-    final uri = Uri.parse('$base$p');
+    if (_serverBase.isEmpty) {
+      throw StateError('server base is empty');
+    }
+    final uri = Uri.parse('$_serverBase$path');
     return query == null ? uri : uri.replace(queryParameters: query);
+  }
+
+  Map<String, dynamic> _decodeMap(http.Response resp) {
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      throw ApiException(resp.statusCode, resp.body);
+    }
+    if (resp.body.trim().isEmpty) return <String, dynamic>{};
+    return (jsonDecode(resp.body) as Map).cast<String, dynamic>();
   }
 
   Map<String, String> _headers({String? token}) {
@@ -98,4 +193,27 @@ class ApiService {
     }
     return headers;
   }
+}
+
+int _asInt(dynamic value, [int fallback = 0]) {
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value.trim()) ?? fallback;
+  return fallback;
+}
+
+String _normalizeServerBase(String value) {
+  var normalized = value.trim();
+  if (normalized.isEmpty) return '';
+  if (!normalized.contains('://')) {
+    normalized = 'http://$normalized';
+  }
+  final uri = Uri.tryParse(normalized);
+  if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+    return normalized.replaceFirst(RegExp(r'/+$'), '');
+  }
+  return uri
+      .replace(path: '', query: null, fragment: null)
+      .toString()
+      .replaceFirst(RegExp(r'/$'), '');
 }

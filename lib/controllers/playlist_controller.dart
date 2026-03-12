@@ -10,18 +10,24 @@ import '../models/manifest.dart';
 import '../models/playlist_item.dart';
 import '../services/api_service.dart';
 import '../services/app_logger.dart';
+import '../services/app_paths.dart';
 import '../services/config_service.dart';
 import '../services/device_store.dart';
 import '../services/manifest_store.dart';
 import '../services/media_cache_service.dart';
-import '../services/app_paths.dart';
+
+enum DeviceSetupStage { booting, setupRequired, pendingApproval, ready }
 
 class PlaylistController extends GetxController {
   final RxBool _isLoading = false.obs;
   final RxInt version = 0.obs;
-  final RxBool isOfflineMode = false.obs; // <-- НОВОЕ: переключатель режима
+  final Rx<DeviceSetupStage> _setupStage = DeviceSetupStage.booting.obs;
+  final RxString _setupMessage = ''.obs;
+  final RxString _serverAddress = ''.obs;
+  final RxString _deviceDisplayName = ''.obs;
+  final RxBool _setupBusy = false.obs;
+  final RxBool isOfflineMode = false.obs;
 
-  // Локальный плейлист (для оффлайн-режима)
   final RxList<PlaylistItem> localItems = <PlaylistItem>[].obs;
 
   final _config = ConfigService();
@@ -37,6 +43,7 @@ class PlaylistController extends GetxController {
 
   Timer? _manifestTimer;
   Timer? _heartbeatTimer;
+  Timer? _registrationPollTimer;
   int _manifestFailures = 0;
   bool _manifestInFlight = false;
   final _rng = Random();
@@ -46,18 +53,19 @@ class PlaylistController extends GetxController {
   static const List<int> _manifestBackoffSeconds = [2, 5, 10, 20, 30];
 
   bool get isLoading => _isLoading.value;
+  DeviceSetupStage get setupStage => _setupStage.value;
+  String get setupMessage => _setupMessage.value;
+  String get serverAddress => _serverAddress.value;
+  String get deviceDisplayName => _deviceDisplayName.value;
+  bool get setupBusy => _setupBusy.value;
+  bool get isReady => _setupStage.value == DeviceSetupStage.ready;
+  bool get isPendingApproval =>
+      _setupStage.value == DeviceSetupStage.pendingApproval;
+  String get deviceId => _auth?.deviceId ?? '';
   Manifest? get manifest => _manifest;
   String get currentRevision => _manifest?.revision ?? '';
   List<ManifestItem> get items => _manifest?.items ?? [];
   List<PlaylistItem> get editorItems => localItems.toList();
-  PlaylistItem? currentOfflineItem(DateTime now) {
-    for (final item in localItems.reversed) {
-      if (item.isActiveAt(now)) {
-        return item;
-      }
-    }
-    return null;
-  }
 
   @override
   void onInit() {
@@ -69,6 +77,7 @@ class PlaylistController extends GetxController {
   void onClose() {
     _manifestTimer?.cancel();
     _heartbeatTimer?.cancel();
+    _registrationPollTimer?.cancel();
     super.onClose();
   }
 
@@ -77,8 +86,12 @@ class PlaylistController extends GetxController {
     try {
       final cfg = await _config.load();
       _mediaRoot = cfg.mediaRoot;
-      _api = ApiService(apiBase: cfg.apiBase);
-      _cache = MediaCacheService(onForbidden: _fetchManifest);
+      _serverAddress.value = cfg.serverUrl;
+      _api = ApiService(serverBase: cfg.serverUrl);
+      _cache = MediaCacheService(
+        onForbidden: _fetchManifest,
+        tokenProvider: () => _auth?.token,
+      );
 
       _auth = await _deviceStore.read();
       _auth ??= DeviceAuth(
@@ -86,34 +99,255 @@ class PlaylistController extends GetxController {
         token: '',
         name: _deviceName(),
       );
+      _deviceDisplayName.value = (_auth?.name?.trim().isNotEmpty ?? false)
+          ? _auth!.name!
+          : _deviceName();
       await _deviceStore.save(_auth!);
-
-      await _registerIfNeeded();
 
       final cachedManifest = await _manifestStore.read();
       if (cachedManifest != null) {
         _setManifest(cachedManifest, source: 'cache');
       }
 
-      // Загружаем локальный плейлист при старте (для аварийного режима)
       await _loadLocalPlaylist();
 
-      await _fetchManifest();
-
-      _heartbeatTimer = Timer.periodic(
-        _heartbeatInterval,
-        (_) => _sendHeartbeat(),
-      );
+      if (_serverAddress.value.isEmpty) {
+        _setSetupRequired(
+          'Укажите адрес сервера и отправьте заявку на регистрацию.',
+        );
+      } else if (_auth?.hasToken ?? false) {
+        _setupStage.value = DeviceSetupStage.ready;
+        _setupMessage.value =
+            'Устройство зарегистрировано и готово к синхронизации.';
+        await _startOnlineSync();
+      } else if (_auth?.hasPendingRequest ?? false) {
+        _setPendingApproval(
+          'Заявка уже отправлена. Ожидается подтверждение на сервере.',
+        );
+        await refreshRegistrationStatus();
+      } else {
+        _setSetupRequired(
+          'Проверьте адрес сервера и отправьте заявку на регистрацию.',
+        );
+      }
     } catch (e) {
       await AppLogger.log('boot error: $e');
-      // Даже при ошибке загружаем локальный плейлист для аварийного режима
       await _loadLocalPlaylist();
+      _setSetupRequired(
+        'Не удалось инициализировать клиент. Проверьте настройки сервера.',
+      );
     } finally {
       _isLoading.value = false;
     }
   }
 
-  // ===== ЛОКАЛЬНЫЙ РЕЖИМ (АВАРИЙНЫЙ) =====
+  Future<bool> verifyServerConnection({
+    String? serverAddress,
+    String? deviceName,
+  }) async {
+    final normalizedServer = _normalizeServerAddress(
+      serverAddress ?? _serverAddress.value,
+    );
+    if (normalizedServer.isEmpty) {
+      _setSetupRequired('Введите IP-адрес или доменное имя сервера.');
+      return false;
+    }
+
+    _setupBusy.value = true;
+    try {
+      _serverAddress.value = normalizedServer;
+      if (deviceName != null && deviceName.trim().isNotEmpty) {
+        _deviceDisplayName.value = deviceName.trim();
+      }
+      _api?.updateServerBase(normalizedServer);
+      await _config.setServerUrl(normalizedServer);
+      final health = await _api!.health();
+      _setSetupRequired(
+        'Соединение установлено: ${health.name} ${health.version}, часовой пояс ${health.timezone}.',
+      );
+      return true;
+    } catch (e) {
+      await AppLogger.log('health check failed: $e');
+      _setSetupRequired(
+        'Не удалось подключиться к серверу. Проверьте адрес и маршрут.',
+      );
+      return false;
+    } finally {
+      _setupBusy.value = false;
+    }
+  }
+
+  Future<bool> submitRegistrationRequest({
+    required String serverAddress,
+    required String deviceName,
+  }) async {
+    final auth = _auth;
+    final api = _api;
+    if (auth == null || api == null) return false;
+
+    final normalizedServer = _normalizeServerAddress(serverAddress);
+    if (normalizedServer.isEmpty) {
+      _setSetupRequired('Введите IP-адрес или доменное имя сервера.');
+      return false;
+    }
+
+    _setupBusy.value = true;
+    try {
+      _serverAddress.value = normalizedServer;
+      _deviceDisplayName.value = deviceName.trim().isNotEmpty
+          ? deviceName.trim()
+          : _deviceName();
+      _api?.updateServerBase(normalizedServer);
+      await _config.setServerUrl(normalizedServer);
+
+      final health = await api.health();
+      await AppLogger.log(
+        'device health ok: name=${health.name} version=${health.version}',
+      );
+
+      final request = await api.requestRegistration(
+        deviceId: auth.deviceId,
+        name: _deviceDisplayName.value,
+        clientVersion: 'panel-client 1.0.0+1',
+      );
+      _auth = auth.copyWith(
+        token: '',
+        name: _deviceDisplayName.value,
+        requestToken: request.requestToken,
+      );
+      await _deviceStore.save(_auth!);
+      _setPendingApproval(
+        request.message.isNotEmpty
+            ? request.message
+            : 'Заявка отправлена. Подтвердите устройство в панели управления.',
+      );
+      _scheduleRegistrationPoll(
+        Duration(
+          seconds: request.pollAfterSeconds > 0 ? request.pollAfterSeconds : 5,
+        ),
+      );
+      return true;
+    } catch (e) {
+      await AppLogger.log('registration request failed: $e');
+      _setSetupRequired(
+        'Не удалось отправить заявку. Проверьте доступ к серверу.',
+      );
+      return false;
+    } finally {
+      _setupBusy.value = false;
+    }
+  }
+
+  Future<void> refreshRegistrationStatus() async {
+    final auth = _auth;
+    final api = _api;
+    if (auth == null || api == null || !auth.hasPendingRequest) return;
+
+    _registrationPollTimer?.cancel();
+    _setupBusy.value = true;
+    try {
+      final status = await api.registrationStatus(
+        deviceId: auth.deviceId,
+        requestToken: auth.requestToken,
+      );
+
+      if (status.isApproved &&
+          status.token != null &&
+          status.token!.isNotEmpty) {
+        _auth = auth.copyWith(
+          token: status.token,
+          requestToken: '',
+          name: status.screenName ?? _deviceDisplayName.value,
+        );
+        _deviceDisplayName.value = _auth?.name ?? _deviceDisplayName.value;
+        await _deviceStore.save(_auth!);
+        _setupStage.value = DeviceSetupStage.ready;
+        _setupMessage.value = 'Устройство подтверждено. Начинаю синхронизацию.';
+        await _startOnlineSync();
+        return;
+      }
+
+      if (status.isRejected) {
+        _auth = auth.copyWith(token: '', requestToken: '');
+        await _deviceStore.save(_auth!);
+        _setSetupRequired(
+          status.message.isNotEmpty
+              ? 'Заявка отклонена: ${status.message}'
+              : 'Заявка отклонена. Измените параметры и отправьте заново.',
+        );
+        return;
+      }
+
+      _setPendingApproval(
+        status.message.isNotEmpty
+            ? status.message
+            : 'Заявка отправлена. Ожидается подтверждение на сервере.',
+      );
+      _scheduleRegistrationPoll(
+        Duration(
+          seconds: status.pollAfterSeconds > 0 ? status.pollAfterSeconds : 5,
+        ),
+      );
+    } catch (e) {
+      await AppLogger.log('registration status failed: $e');
+      _setPendingApproval(
+        'Сервер временно недоступен. Повторю проверку автоматически.',
+      );
+      _scheduleRegistrationPoll(const Duration(seconds: 10));
+    } finally {
+      _setupBusy.value = false;
+    }
+  }
+
+  Future<void> resetRegistrationFlow() async {
+    _registrationPollTimer?.cancel();
+    _manifestTimer?.cancel();
+    _heartbeatTimer?.cancel();
+    final auth = _auth;
+    if (auth != null) {
+      _auth = auth.copyWith(
+        token: '',
+        requestToken: '',
+        name: _deviceDisplayName.value,
+      );
+      await _deviceStore.save(_auth!);
+    }
+    _setSetupRequired('Проверьте адрес сервера и отправьте новую заявку.');
+  }
+
+  void _setSetupRequired(String message) {
+    _registrationPollTimer?.cancel();
+    _setupStage.value = DeviceSetupStage.setupRequired;
+    _setupMessage.value = message;
+  }
+
+  void _setPendingApproval(String message) {
+    _setupStage.value = DeviceSetupStage.pendingApproval;
+    _setupMessage.value = message;
+  }
+
+  Future<void> _startOnlineSync() async {
+    _registrationPollTimer?.cancel();
+    _heartbeatTimer?.cancel();
+    await _fetchManifest();
+    _heartbeatTimer = Timer.periodic(
+      _heartbeatInterval,
+      (_) => _sendHeartbeat(),
+    );
+  }
+
+  void _scheduleRegistrationPoll(Duration delay) {
+    _registrationPollTimer?.cancel();
+    _registrationPollTimer = Timer(delay, refreshRegistrationStatus);
+  }
+
+  Future<void> _handleAuthLoss(String reason) async {
+    await AppLogger.log('device auth lost: $reason');
+    await resetRegistrationFlow();
+    _setupMessage.value =
+        'Доступ устройства больше не действителен. Отправьте новую заявку на регистрацию.';
+  }
+
   Future<void> _loadLocalPlaylist() async {
     try {
       final file = await AppPaths.playlistFile();
@@ -187,18 +421,22 @@ class PlaylistController extends GetxController {
     }
   }
 
-  /// Получает текущий элемент для воспроизведения (с учётом режима)
   dynamic currentItem(DateTime now) {
     if (isOfflineMode.value) {
-      // Оффлайн-режим: при пересечении окон берём последний начавшийся элемент.
       return currentOfflineItem(now);
-    } else {
-      // Онлайн-режим: используем манифест
-      return currentSlot(now);
     }
+    return currentSlot(now);
   }
 
-  /// Совместимость: заглушка для онлайн-режима, в оффлайн-режиме перезагружает локальный плейлист
+  PlaylistItem? currentOfflineItem(DateTime now) {
+    for (final item in localItems.reversed) {
+      if (item.isActiveAt(now)) {
+        return item;
+      }
+    }
+    return null;
+  }
+
   Future<void> loadPlaylist() async {
     if (isOfflineMode.value) {
       await refreshLocalPlaylist();
@@ -206,7 +444,6 @@ class PlaylistController extends GetxController {
       await _fetchManifest();
     }
   }
-  // ===== КОНЕЦ ЛОКАЛЬНОГО РЕЖИМА =====
 
   Future<void> enableOfflineMode() async {
     if (isOfflineMode.value) return;
@@ -222,53 +459,26 @@ class PlaylistController extends GetxController {
     isOfflineMode.value = false;
     version.value++;
     await AppLogger.log('Offline emergency mode disabled');
-    await _fetchManifest();
-    unawaited(_sendHeartbeat());
-  }
-
-  Future<void> _registerIfNeeded({bool force = false}) async {
-    final api = _api;
-    final auth = _auth;
-    if (api == null || auth == null) return;
-    if (auth.hasToken && !force) return;
-
-    try {
-      final registered = await api.register(
-        deviceId: auth.deviceId,
-        name: auth.name ?? _deviceName(),
-      );
-      _auth = DeviceAuth(
-        deviceId: registered.deviceId,
-        token: registered.token,
-        name: auth.name ?? registered.name,
-      );
-      await _deviceStore.save(_auth!);
-      await AppLogger.log('registered device_id=${_auth!.deviceId}');
-    } catch (e) {
-      await AppLogger.log('register failed: $e');
+    if (isReady) {
+      await _fetchManifest();
+      unawaited(_sendHeartbeat());
     }
   }
 
   Future<void> _fetchManifest() async {
-    if (isOfflineMode.value) return; // В оффлайн-режиме не опрашиваем сервер
+    if (isOfflineMode.value || !isReady) return;
 
     final api = _api;
     final auth = _auth;
-    if (api == null || auth == null) return;
+    if (api == null || auth == null || !auth.hasToken) return;
 
     if (_manifestInFlight) return;
     _manifestInFlight = true;
 
     try {
-      if (!auth.hasToken) {
-        await _registerIfNeeded();
-      }
-      final refreshed = _auth;
-      if (refreshed == null) return;
-
       final manifest = await api.fetchManifest(
-        deviceId: refreshed.deviceId,
-        token: refreshed.token,
+        deviceId: auth.deviceId,
+        token: auth.token,
       );
       _manifestFailures = 0;
       if (_manifest?.revision == manifest.revision) return;
@@ -276,6 +486,12 @@ class PlaylistController extends GetxController {
       _setManifest(manifest, source: 'api');
       await _manifestStore.save(manifest);
       _prefetchMedia(manifest);
+    } on ApiException catch (e) {
+      _manifestFailures++;
+      await AppLogger.log('manifest fetch failed: $e');
+      if (e.statusCode == 401 || e.statusCode == 404) {
+        await _handleAuthLoss('manifest ${e.statusCode}');
+      }
     } catch (e) {
       _manifestFailures++;
       await AppLogger.log('manifest fetch failed: $e');
@@ -296,7 +512,7 @@ class PlaylistController extends GetxController {
   }
 
   void _prefetchMedia(Manifest manifest) {
-    if (isOfflineMode.value) return; // В оффлайн-режиме не префетчим
+    if (isOfflineMode.value || !isReady) return;
 
     final now = DateTime.now();
     final prefetch = Duration(seconds: manifest.prefetchSeconds);
@@ -327,7 +543,7 @@ class PlaylistController extends GetxController {
   }
 
   Future<void> updateNowPlaying(String? nowPlaying) async {
-    if (isOfflineMode.value) return; // В оффлайн-режиме не отправляем статус
+    if (isOfflineMode.value || !isReady) return;
 
     if (_nowPlaying == nowPlaying) return;
     _nowPlaying = nowPlaying;
@@ -335,7 +551,7 @@ class PlaylistController extends GetxController {
   }
 
   void _scheduleManifestFetch() {
-    if (isOfflineMode.value) return; // В оффлайн-режиме не планируем опрос
+    if (isOfflineMode.value || !isReady) return;
 
     _manifestTimer?.cancel();
     final delay = _manifestFailures == 0
@@ -357,45 +573,24 @@ class PlaylistController extends GetxController {
   }
 
   Future<void> _sendHeartbeat() async {
-    if (isOfflineMode.value) return; // В оффлайн-режиме не отправляем heartbeat
+    if (isOfflineMode.value || !isReady) return;
 
     final api = _api;
     final auth = _auth;
-    if (api == null || auth == null) return;
+    if (api == null || auth == null || !auth.hasToken) return;
 
     try {
-      if (!auth.hasToken) {
-        await _registerIfNeeded();
-      }
-      final refreshed = _auth;
-      if (refreshed == null) return;
-
       await api.heartbeat(
-        deviceId: refreshed.deviceId,
+        deviceId: auth.deviceId,
         currentRevision: currentRevision,
         nowPlaying: _nowPlaying,
-        token: refreshed.token,
+        token: auth.token,
       );
     } on ApiException catch (e) {
-      if (e.statusCode == 404) {
-        await AppLogger.log('heartbeat 404 → re-register');
-        await _registerIfNeeded(force: true);
-        final refreshed = _auth;
-        if (refreshed == null) return;
-        try {
-          await api.heartbeat(
-            deviceId: refreshed.deviceId,
-            currentRevision: currentRevision,
-            nowPlaying: _nowPlaying,
-            token: refreshed.token,
-          );
-          return;
-        } catch (err) {
-          await AppLogger.log('heartbeat retry failed: $err');
-          return;
-        }
-      }
       await AppLogger.log('heartbeat failed: $e');
+      if (e.statusCode == 401 || e.statusCode == 404) {
+        await _handleAuthLoss('heartbeat ${e.statusCode}');
+      }
     } catch (e) {
       await AppLogger.log('heartbeat failed: $e');
     }
@@ -430,5 +625,21 @@ class PlaylistController extends GetxController {
     final bytes = List<int>.generate(10, (_) => rand.nextInt(256));
     final token = base64Url.encode(bytes).replaceAll('=', '');
     return 'dev_${DateTime.now().millisecondsSinceEpoch}_$token';
+  }
+
+  String _normalizeServerAddress(String raw) {
+    var normalized = raw.trim();
+    if (normalized.isEmpty) return '';
+    if (!normalized.contains('://')) {
+      normalized = 'http://$normalized';
+    }
+    final uri = Uri.tryParse(normalized);
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+      return normalized.replaceFirst(RegExp(r'/+$'), '');
+    }
+    return uri
+        .replace(path: '', query: null, fragment: null)
+        .toString()
+        .replaceFirst(RegExp(r'/$'), '');
   }
 }
