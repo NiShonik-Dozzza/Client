@@ -88,6 +88,7 @@ class PlaylistController extends GetxController {
       _mediaRoot = cfg.mediaRoot;
       _serverAddress.value = cfg.serverUrl;
       _api = ApiService(serverBase: cfg.serverUrl);
+      await _repairServerAddressIfNeeded();
       _cache = MediaCacheService(
         onForbidden: _fetchManifest,
         tokenProvider: () => _auth?.token,
@@ -155,15 +156,19 @@ class PlaylistController extends GetxController {
 
     _setupBusy.value = true;
     try {
-      _serverAddress.value = normalizedServer;
+      final (resolvedServer, health) = await _resolveServerBaseWithHealth(
+        normalizedServer,
+      );
+      _serverAddress.value = resolvedServer;
       if (deviceName != null && deviceName.trim().isNotEmpty) {
         _deviceDisplayName.value = deviceName.trim();
       }
-      _api?.updateServerBase(normalizedServer);
-      await _config.setServerUrl(normalizedServer);
-      final health = await _api!.health();
+      _api?.updateServerBase(resolvedServer);
+      await _config.setServerUrl(resolvedServer);
       _setSetupRequired(
-        'Соединение установлено: ${health.name} ${health.version}, часовой пояс ${health.timezone}.',
+        resolvedServer == normalizedServer
+            ? 'Соединение установлено: ${health.name} ${health.version}, часовой пояс ${health.timezone}.'
+            : 'Соединение установлено: ${health.name} ${health.version}, часовой пояс ${health.timezone}. Использую адрес $resolvedServer.',
       );
       return true;
     } catch (e) {
@@ -193,16 +198,17 @@ class PlaylistController extends GetxController {
 
     _setupBusy.value = true;
     try {
-      _serverAddress.value = normalizedServer;
+      final (resolvedServer, health) = await _resolveServerBaseWithHealth(
+        normalizedServer,
+      );
+      _serverAddress.value = resolvedServer;
       _deviceDisplayName.value = deviceName.trim().isNotEmpty
           ? deviceName.trim()
           : _deviceName();
-      _api?.updateServerBase(normalizedServer);
-      await _config.setServerUrl(normalizedServer);
-
-      final health = await api.health();
+      _api?.updateServerBase(resolvedServer);
+      await _config.setServerUrl(resolvedServer);
       await AppLogger.log(
-        'device health ok: name=${health.name} version=${health.version}',
+        'device health ok: name=${health.name} version=${health.version} server=$resolvedServer',
       );
 
       final request = await api.requestRegistration(
@@ -481,9 +487,18 @@ class PlaylistController extends GetxController {
         token: auth.token,
       );
       _manifestFailures = 0;
-      if (_manifest?.revision == manifest.revision) return;
+      final currentManifest = _manifest;
+      if (currentManifest != null &&
+          _manifestSignature(currentManifest) == _manifestSignature(manifest)) {
+        return;
+      }
 
-      _setManifest(manifest, source: 'api');
+      _setManifest(
+        manifest,
+        source: currentManifest?.revision == manifest.revision
+            ? 'api-refresh'
+            : 'api',
+      );
       await _manifestStore.save(manifest);
       _prefetchMedia(manifest);
     } on ApiException catch (e) {
@@ -572,6 +587,8 @@ class PlaylistController extends GetxController {
     return Duration(milliseconds: ms < 500 ? 500 : ms);
   }
 
+  String _manifestSignature(Manifest manifest) => jsonEncode(manifest.toJson());
+
   Future<void> _sendHeartbeat() async {
     if (isOfflineMode.value || !isReady) return;
 
@@ -625,6 +642,81 @@ class PlaylistController extends GetxController {
     final bytes = List<int>.generate(10, (_) => rand.nextInt(256));
     final token = base64Url.encode(bytes).replaceAll('=', '');
     return 'dev_${DateTime.now().millisecondsSinceEpoch}_$token';
+  }
+
+  Future<void> _repairServerAddressIfNeeded() async {
+    final current = _serverAddress.value;
+    if (!_shouldTryHttp443Fallback(current)) {
+      return;
+    }
+
+    try {
+      final (resolvedServer, _) = await _resolveServerBaseWithHealth(current);
+      if (resolvedServer == current) {
+        return;
+      }
+      _serverAddress.value = resolvedServer;
+      _api?.updateServerBase(resolvedServer);
+      await _config.setServerUrl(resolvedServer);
+      await AppLogger.log(
+        'Server address auto-updated: $current -> $resolvedServer',
+      );
+    } catch (e) {
+      await AppLogger.log('server address probe failed: $e');
+    }
+  }
+
+  Future<(String, DeviceHealth)> _resolveServerBaseWithHealth(
+    String raw,
+  ) async {
+    final normalized = _normalizeServerAddress(raw);
+    if (normalized.isEmpty) {
+      throw StateError('server address is empty');
+    }
+
+    Object? lastError;
+    StackTrace? lastStackTrace;
+    for (final candidate in _serverCandidates(normalized)) {
+      try {
+        final health = await ApiService(serverBase: candidate).health();
+        return (candidate, health);
+      } catch (e, st) {
+        lastError = e;
+        lastStackTrace = st;
+      }
+    }
+
+    if (lastError != null) {
+      Error.throwWithStackTrace(lastError, lastStackTrace!);
+    }
+    throw StateError('No server candidates to probe');
+  }
+
+  List<String> _serverCandidates(String normalized) {
+    final candidates = <String>[normalized];
+    if (!_shouldTryHttp443Fallback(normalized)) {
+      return candidates;
+    }
+
+    final uri = Uri.parse(normalized);
+    final fallback = uri
+        .replace(port: 443)
+        .toString()
+        .replaceFirst(RegExp(r'/$'), '');
+    if (!candidates.contains(fallback)) {
+      candidates.add(fallback);
+    }
+    return candidates;
+  }
+
+  bool _shouldTryHttp443Fallback(String value) {
+    final normalized = _normalizeServerAddress(value);
+    if (normalized.isEmpty) return false;
+    final uri = Uri.tryParse(normalized);
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+      return false;
+    }
+    return uri.scheme == 'http' && !uri.hasPort;
   }
 
   String _normalizeServerAddress(String raw) {
