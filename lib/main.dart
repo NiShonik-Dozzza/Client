@@ -1,13 +1,20 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:media_kit/media_kit.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'controllers/playlist_controller.dart';
+import 'views/setup_screen.dart';
 import 'views/player_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
+  await _configureAppWindow();
 
   Get.put(PlaylistController(), permanent: true);
 
@@ -21,7 +28,182 @@ class App extends StatelessWidget {
   Widget build(BuildContext context) {
     return const GetMaterialApp(
       debugShowCheckedModeBanner: false,
-      home: PlayerScreen(),
+      home: WindowShell(child: RootScreen()),
     );
+  }
+}
+
+Future<void> _configureAppWindow() async {
+  if (!kIsWeb && Platform.isAndroid) {
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    return;
+  }
+
+  if (kIsWeb || !(Platform.isWindows || Platform.isLinux)) return;
+
+  try {
+    await windowManager.ensureInitialized();
+
+    const windowOptions = WindowOptions(
+      title: 'panel',
+      backgroundColor: Colors.black,
+    );
+
+    windowManager.waitUntilReadyToShow(windowOptions, () async {
+      await windowManager.show();
+      await windowManager.focus();
+      await _setDesktopFullscreen(true);
+    });
+  } catch (_) {
+    // Fallback to the default desktop window if the plugin is unavailable.
+  }
+}
+
+Future<void> _setDesktopFullscreen(bool enabled) async {
+  if (kIsWeb || !(Platform.isWindows || Platform.isLinux)) return;
+
+  if (enabled) {
+    await windowManager.setTitleBarStyle(
+      TitleBarStyle.hidden,
+      windowButtonVisibility: false,
+    );
+    await windowManager.setFullScreen(true);
+    return;
+  }
+
+  await windowManager.setFullScreen(false);
+  await windowManager.setTitleBarStyle(
+    TitleBarStyle.normal,
+    windowButtonVisibility: true,
+  );
+  await windowManager.show();
+  await windowManager.focus();
+}
+
+class WindowShell extends StatefulWidget {
+  const WindowShell({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  State<WindowShell> createState() => _WindowShellState();
+}
+
+class _WindowShellState extends State<WindowShell> {
+  static const Duration _doubleTapWindow = Duration(milliseconds: 350);
+  static const double _doubleTapMaxDistance = 24;
+
+  final FocusNode _focusNode = FocusNode(debugLabel: 'window-shell');
+  DateTime? _lastPointerDownAt;
+  Offset? _lastPointerDownPosition;
+  bool _toggleInProgress = false;
+
+  bool get _supportsDesktopToggle =>
+      !kIsWeb && (Platform.isWindows || Platform.isLinux);
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _focusNode.requestFocus();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
+    if (!_supportsDesktopToggle || event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.escape) {
+      _toggleFullscreen(enabled: false);
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
+  }
+
+  void _handlePointerDown(PointerDownEvent event) {
+    if (!_supportsDesktopToggle) return;
+
+    final now = DateTime.now();
+    final lastAt = _lastPointerDownAt;
+    final lastPosition = _lastPointerDownPosition;
+
+    _lastPointerDownAt = now;
+    _lastPointerDownPosition = event.position;
+
+    if (lastAt == null || lastPosition == null) return;
+    if (now.difference(lastAt) > _doubleTapWindow) return;
+
+    final delta = event.position - lastPosition;
+    if (delta.distance > _doubleTapMaxDistance) return;
+
+    _lastPointerDownAt = null;
+    _lastPointerDownPosition = null;
+    _toggleFullscreen();
+  }
+
+  Future<void> _toggleFullscreen({bool? enabled}) async {
+    if (!_supportsDesktopToggle || _toggleInProgress) return;
+    _toggleInProgress = true;
+
+    try {
+      final isFullScreen = await windowManager.isFullScreen();
+      final target = enabled ?? !isFullScreen;
+      if (target == isFullScreen) return;
+
+      await _setDesktopFullscreen(target);
+    } catch (_) {
+      // Ignore desktop window API failures and keep the app usable.
+    } finally {
+      _toggleInProgress = false;
+      if (mounted) {
+        _focusNode.requestFocus();
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Focus(
+      focusNode: _focusNode,
+      autofocus: true,
+      onKeyEvent: _handleKey,
+      child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: _handlePointerDown,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+class RootScreen extends StatelessWidget {
+  const RootScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = Get.find<PlaylistController>();
+    return Obx(() {
+      switch (controller.setupStage) {
+        case DeviceSetupStage.booting:
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        case DeviceSetupStage.ready:
+          return const PlayerScreen();
+        case DeviceSetupStage.setupRequired:
+        case DeviceSetupStage.pendingApproval:
+          return const SetupScreen();
+      }
+    });
   }
 }

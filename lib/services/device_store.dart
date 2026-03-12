@@ -7,14 +7,21 @@ class DeviceAuth {
   final String deviceId;
   final String token;
   final String? name;
+  final String requestToken;
 
-  DeviceAuth({required this.deviceId, required this.token, this.name});
+  DeviceAuth({
+    required this.deviceId,
+    required this.token,
+    this.name,
+    this.requestToken = '',
+  });
 
   factory DeviceAuth.fromJson(Map<String, dynamic> json) {
     return DeviceAuth(
       deviceId: (json['device_id'] as String?)?.trim() ?? '',
       token: (json['token'] as String?)?.trim() ?? '',
       name: (json['name'] as String?)?.trim(),
+      requestToken: (json['request_token'] as String?)?.trim() ?? '',
     );
   }
 
@@ -22,9 +29,25 @@ class DeviceAuth {
     'device_id': deviceId,
     'token': token,
     if (name != null) 'name': name,
+    if (requestToken.isNotEmpty) 'request_token': requestToken,
   };
 
   bool get hasToken => token.isNotEmpty;
+  bool get hasPendingRequest => requestToken.isNotEmpty;
+
+  DeviceAuth copyWith({
+    String? deviceId,
+    String? token,
+    String? name,
+    String? requestToken,
+  }) {
+    return DeviceAuth(
+      deviceId: deviceId ?? this.deviceId,
+      token: token ?? this.token,
+      name: name ?? this.name,
+      requestToken: requestToken ?? this.requestToken,
+    );
+  }
 }
 
 class DeviceStore {
