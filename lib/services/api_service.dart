@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
@@ -93,6 +94,12 @@ class DeviceRegistrationStatus {
 }
 
 class ApiService {
+  static const Duration _healthTimeout = Duration(seconds: 4);
+  static const Duration _registrationTimeout = Duration(seconds: 6);
+  static const Duration _statusTimeout = Duration(seconds: 6);
+  static const Duration _manifestTimeout = Duration(seconds: 8);
+  static const Duration _heartbeatTimeout = Duration(seconds: 5);
+
   ApiService({required String serverBase, http.Client? client})
     : _serverBase = _normalizeServerBase(serverBase),
       _client = client ?? http.Client();
@@ -105,7 +112,10 @@ class ApiService {
   }
 
   Future<DeviceHealth> health() async {
-    final resp = await _client.get(_buildUri('/api/v1/device/health'));
+    final resp = await _get(
+      _buildUri('/api/v1/device/health'),
+      timeout: _healthTimeout,
+    );
     return DeviceHealth.fromJson(_decodeMap(resp));
   }
 
@@ -114,8 +124,9 @@ class ApiService {
     String? name,
     String? clientVersion,
   }) async {
-    final resp = await _client.post(
+    final resp = await _post(
       _buildUri('/api/v1/device/register/request'),
+      timeout: _registrationTimeout,
       headers: _headers(),
       body: jsonEncode({
         'device_id': deviceId,
@@ -131,11 +142,12 @@ class ApiService {
     required String deviceId,
     required String requestToken,
   }) async {
-    final resp = await _client.get(
+    final resp = await _get(
       _buildUri('/api/v1/device/register/status', {
         'device_id': deviceId,
         'request_token': requestToken,
       }),
+      timeout: _statusTimeout,
       headers: _headers(),
     );
     return DeviceRegistrationStatus.fromJson(_decodeMap(resp));
@@ -145,8 +157,9 @@ class ApiService {
     required String deviceId,
     String? token,
   }) async {
-    final resp = await _client.get(
+    final resp = await _get(
       _buildUri('/api/v1/device/manifest', {'device_id': deviceId}),
+      timeout: _manifestTimeout,
       headers: _headers(token: token),
     );
     return Manifest.fromJson(_decodeMap(resp));
@@ -158,8 +171,9 @@ class ApiService {
     required String? nowPlaying,
     String? token,
   }) async {
-    final resp = await _client.post(
+    final resp = await _post(
       _buildUri('/api/v1/device/heartbeat'),
+      timeout: _heartbeatTimeout,
       headers: _headers(token: token),
       body: jsonEncode({
         'device_id': deviceId,
@@ -168,6 +182,40 @@ class ApiService {
       }),
     );
     _decodeMap(resp);
+  }
+
+  Future<http.Response> _get(
+    Uri uri, {
+    required Duration timeout,
+    Map<String, String>? headers,
+  }) {
+    return _withTimeout(_client.get(uri, headers: headers), uri, timeout);
+  }
+
+  Future<http.Response> _post(
+    Uri uri, {
+    required Duration timeout,
+    Map<String, String>? headers,
+    Object? body,
+  }) {
+    return _withTimeout(
+      _client.post(uri, headers: headers, body: body),
+      uri,
+      timeout,
+    );
+  }
+
+  Future<http.Response> _withTimeout(
+    Future<http.Response> request,
+    Uri uri,
+    Duration timeout,
+  ) {
+    return request.timeout(
+      timeout,
+      onTimeout: () => throw TimeoutException(
+        'Request to $uri timed out after ${timeout.inSeconds} seconds',
+      ),
+    );
   }
 
   Uri _buildUri(String path, [Map<String, String>? query]) {

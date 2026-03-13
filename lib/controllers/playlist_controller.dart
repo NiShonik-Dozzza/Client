@@ -160,17 +160,15 @@ class PlaylistController extends GetxController {
         _deviceDisplayName.value = deviceName.trim();
       }
       _api?.updateServerBase(normalizedServer);
-      await _config.setServerUrl(normalizedServer);
       final health = await _api!.health();
+      await _config.setServerUrl(normalizedServer);
       _setSetupRequired(
         'Соединение установлено: ${health.name} ${health.version}, часовой пояс ${health.timezone}.',
       );
       return true;
     } catch (e) {
       await AppLogger.log('health check failed: $e');
-      _setSetupRequired(
-        'Не удалось подключиться к серверу. Проверьте адрес и маршрут.',
-      );
+      _setSetupRequired(_setupErrorMessage(e));
       return false;
     } finally {
       _setupBusy.value = false;
@@ -198,9 +196,9 @@ class PlaylistController extends GetxController {
           ? deviceName.trim()
           : _deviceName();
       _api?.updateServerBase(normalizedServer);
-      await _config.setServerUrl(normalizedServer);
 
       final health = await api.health();
+      await _config.setServerUrl(normalizedServer);
       await AppLogger.log(
         'device health ok: name=${health.name} version=${health.version}',
       );
@@ -229,9 +227,7 @@ class PlaylistController extends GetxController {
       return true;
     } catch (e) {
       await AppLogger.log('registration request failed: $e');
-      _setSetupRequired(
-        'Не удалось отправить заявку. Проверьте доступ к серверу.',
-      );
+      _setSetupRequired(_setupErrorMessage(e));
       return false;
     } finally {
       _setupBusy.value = false;
@@ -641,5 +637,18 @@ class PlaylistController extends GetxController {
         .replace(path: '', query: null, fragment: null)
         .toString()
         .replaceFirst(RegExp(r'/$'), '');
+  }
+
+  String _setupErrorMessage(Object error) {
+    if (error is TimeoutException) {
+      return 'Сервер не ответил вовремя. Проверьте адрес и сеть, затем повторите попытку.';
+    }
+    if (error is SocketException) {
+      return 'Не удалось подключиться к серверу. Проверьте адрес, порт и доступность сети.';
+    }
+    if (error is ApiException) {
+      return 'Сервер ответил ошибкой ${error.statusCode}. Проверьте адрес и состояние сервера.';
+    }
+    return 'Не удалось подключиться к серверу. Проверьте адрес и маршрут.';
   }
 }
