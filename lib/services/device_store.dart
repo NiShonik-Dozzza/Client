@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import '../services/app_logger.dart';
 import '../services/app_paths.dart';
@@ -55,6 +56,7 @@ class DeviceStore {
     try {
       final file = await AppPaths.deviceFile();
       if (!await file.exists()) return null;
+      await _protectDeviceFile(file);
       final map = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
       final auth = DeviceAuth.fromJson(map);
       if (auth.deviceId.isEmpty) return null;
@@ -67,6 +69,22 @@ class DeviceStore {
 
   Future<void> save(DeviceAuth auth) async {
     final file = await AppPaths.deviceFile();
-    await file.writeAsString(jsonEncode(auth.toJson()), flush: true);
+    final temp = File('${file.path}.tmp');
+    await temp.writeAsString(jsonEncode(auth.toJson()), flush: true);
+    await _protectDeviceFile(temp);
+    if (await file.exists()) {
+      await file.delete();
+    }
+    await temp.rename(file.path);
+    await _protectDeviceFile(file);
+  }
+
+  Future<void> _protectDeviceFile(File file) async {
+    if (!(Platform.isLinux || Platform.isMacOS)) return;
+    try {
+      await Process.run('chmod', ['600', file.path]);
+    } catch (e) {
+      await AppLogger.log('DeviceStore chmod warning: $e');
+    }
   }
 }

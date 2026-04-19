@@ -124,7 +124,7 @@ class _SetupScreenState extends State<SetupScreen> {
                             decoration: const InputDecoration(
                               labelText: 'Адрес сервера',
                               hintText:
-                                  'Например: 192.168.1.50:443 или http://192.168.1.50:443',
+                                  'Например: 192.168.1.50:8088 или http://192.168.1.50:8088',
                               border: OutlineInputBorder(),
                             ),
                           ),
