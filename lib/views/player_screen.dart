@@ -821,6 +821,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     final slot = _currentSlot;
+    final controller = Get.find<PlaylistController>();
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -901,6 +902,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   'now=${_formatDebugTime(DateTime.now())}\n'
                   'mode=$_mode\n'
                   'slot=${slot == null ? "-" : slot.contentType.name}:${slot?.contentId}\n'
+                  'manifest=${controller.currentRevision} items=${controller.items.length}\n'
+                  'sync=${controller.syncDiagnostics}\n'
                   'start=${_formatDebugTime(slot?.startTime)}\n'
                   'stop=${_formatDebugTime(slot?.endTime)}\n'
                   'loop=${slot?.loopMode.name}\n'

@@ -26,6 +26,7 @@ class PlaylistController extends GetxController {
   final RxString _serverAddress = ''.obs;
   final RxString _deviceDisplayName = ''.obs;
   final RxBool _setupBusy = false.obs;
+  final RxString _syncDiagnostics = ''.obs;
   final RxBool isOfflineMode = false.obs;
 
   final RxList<PlaylistItem> localItems = <PlaylistItem>[].obs;
@@ -57,6 +58,7 @@ class PlaylistController extends GetxController {
   String get setupMessage => _setupMessage.value;
   String get serverAddress => _serverAddress.value;
   String get deviceDisplayName => _deviceDisplayName.value;
+  String get syncDiagnostics => _syncDiagnostics.value;
   bool get setupBusy => _setupBusy.value;
   bool get isReady => _setupStage.value == DeviceSetupStage.ready;
   bool get isPendingApproval =>
@@ -280,6 +282,17 @@ class PlaylistController extends GetxController {
           status.message.isNotEmpty
               ? 'Заявка отклонена: ${status.message}'
               : 'Заявка отклонена. Измените параметры и отправьте заново.',
+        );
+        return;
+      }
+
+      if (status.isExpired || status.isRevoked) {
+        _auth = auth.copyWith(token: '', requestToken: '');
+        await _deviceStore.save(_auth!);
+        _setSetupRequired(
+          status.message.isNotEmpty
+              ? status.message
+              : 'Заявка больше не действительна. Отправьте новую заявку на регистрацию.',
         );
         return;
       }
@@ -515,12 +528,18 @@ class PlaylistController extends GetxController {
             ? 'api-refresh'
             : 'api',
       );
+      if (manifest.items.isEmpty) {
+        await AppLogger.log(
+          'Manifest is empty: rev=${manifest.revision} media=${manifest.media.length} playlists=${manifest.playlists.length}',
+        );
+      }
       await _manifestStore.save(manifest);
       _prefetchMedia(manifest);
     } on ApiException catch (e) {
       _manifestFailures++;
+      _syncDiagnostics.value = 'manifest error ${e.statusCode}';
       await AppLogger.log('manifest fetch failed: $e');
-      if (e.statusCode == 401 || e.statusCode == 404) {
+      if (e.statusCode == 401 || e.statusCode == 403 || e.statusCode == 404) {
         await _handleAuthLoss('manifest ${e.statusCode}');
       }
     } catch (e) {
@@ -535,6 +554,8 @@ class PlaylistController extends GetxController {
   void _setManifest(Manifest manifest, {required String source}) {
     _manifest = manifest;
     version.value++;
+    _syncDiagnostics.value =
+        'manifest=$source rev=${manifest.revision} items=${manifest.items.length} media=${manifest.media.length} playlists=${manifest.playlists.length}';
     unawaited(
       AppLogger.log(
         'Manifest updated ($source): rev=${manifest.revision} items=${manifest.items.length}',
@@ -621,7 +642,8 @@ class PlaylistController extends GetxController {
       );
     } on ApiException catch (e) {
       await AppLogger.log('heartbeat failed: $e');
-      if (e.statusCode == 401 || e.statusCode == 404) {
+      _syncDiagnostics.value = 'heartbeat error ${e.statusCode}';
+      if (e.statusCode == 401 || e.statusCode == 403 || e.statusCode == 404) {
         await _handleAuthLoss('heartbeat ${e.statusCode}');
       }
     } catch (e) {
