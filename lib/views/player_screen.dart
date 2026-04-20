@@ -47,6 +47,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   late final List<VideoController> _videoControllers;
   int _activeVideoIndex = 0;
   _PreparedVideo? _preparedVideo;
+  String? _activeVideoSource;
 
   // ===== ДОБАВЛЕНО: поддержка редактора =====
   bool _isEditorOpen = false; // Отслеживает открыт ли редактор
@@ -78,10 +79,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // debug overlay
   bool _debug = false; // скрыт по умолчанию
 
-  VideoController get _activeVideoController =>
-      _videoControllers[_activeVideoIndex];
   int get _standbyVideoIndex => _activeVideoIndex == 0 ? 1 : 0;
   Player get _standbyPlayer => _players[_standbyVideoIndex];
+
+  Widget _buildVideoView() {
+    return Stack(
+      fit: StackFit.expand,
+      children: List.generate(_videoControllers.length, (index) {
+        return IgnorePointer(
+          child: AnimatedOpacity(
+            opacity: index == _activeVideoIndex ? 1 : 0,
+            duration: const Duration(milliseconds: 90),
+            child: Video(
+              key: ValueKey('video-layer-$index'),
+              controller: _videoControllers[index],
+              fit: BoxFit.contain,
+            ),
+          ),
+        );
+      }),
+    );
+  }
 
   Widget _buildImageView() {
     final imageKey = ValueKey(_imagePath);
@@ -267,8 +285,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    final same = !force && _isSameSlot(_currentSlot, nextSlot);
-    if (same) return;
+    final sameSlot = _isSameSlot(_currentSlot, nextSlot);
+    if (sameSlot && (!force || _mode != _Mode.black)) return;
 
     _currentSlot = nextSlot;
     _currentMedia = null;
@@ -335,7 +353,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     // Проверяем, тот же ли элемент
     final same =
-        !force &&
         _currentSlot == null &&
         _currentMedia == null &&
         _lastOfflineItem != null &&
@@ -343,7 +360,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _lastOfflineItem!.startDate == nextItem.startDate &&
         _lastOfflineItem!.stopDate == nextItem.stopDate;
 
-    if (same) return;
+    if (same && (!force || _mode != _Mode.black)) return;
 
     _lastOfflineItem = nextItem;
 
@@ -456,6 +473,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } catch (_) {}
   }
 
+  Future<void> _silenceAndStopPlayer(int playerIndex) async {
+    try {
+      await _players[playerIndex].pause();
+      await _players[playerIndex].setPlaylistMode(PlaylistMode.none);
+      await _players[playerIndex].setVolume(0);
+      await _players[playerIndex].stop();
+    } catch (_) {}
+  }
+
   Future<void> _openVideoOnPlayer(
     int playerIndex,
     String source, {
@@ -484,24 +510,48 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final previousActive = _activeVideoIndex;
     _activeVideoIndex = prepared.playerIndex;
     _preparedVideo = null;
+    _activeVideoSource = source;
 
     await _players[_activeVideoIndex].setPlaylistMode(
       loopSingle ? PlaylistMode.single : PlaylistMode.none,
     );
-    await _players[_activeVideoIndex].setVolume(100);
+    await _players[_activeVideoIndex].setVolume(0);
     await _players[_activeVideoIndex].play();
-
-    try {
-      await _players[previousActive].pause();
-      await _players[previousActive].setVolume(0);
-      await _players[previousActive].stop();
-    } catch (_) {}
 
     _expectVideoCompleted = !loopSingle;
     if (mounted) {
       setState(() => _mode = _Mode.video);
     }
+    await _players[_activeVideoIndex].setVolume(100);
+    await _silenceAndStopPlayer(previousActive);
     return true;
+  }
+
+  Future<void> _switchToVideoOnStandby(
+    String source, {
+    required bool loopSingle,
+  }) async {
+    final previousActive = _activeVideoIndex;
+    final nextActive = _standbyVideoIndex;
+    _preparedVideo = null;
+
+    final nextPlayer = _players[nextActive];
+    await nextPlayer.setPlaylistMode(
+      loopSingle ? PlaylistMode.single : PlaylistMode.none,
+    );
+    await nextPlayer.setVolume(0);
+    await nextPlayer.open(Playlist([Media(source)]), play: true);
+
+    _activeVideoIndex = nextActive;
+    _activeVideoSource = source;
+    _expectVideoCompleted = !loopSingle;
+
+    if (mounted) {
+      setState(() => _mode = _Mode.video);
+    }
+
+    await nextPlayer.setVolume(100);
+    await _silenceAndStopPlayer(previousActive);
   }
 
   Future<void> _playVideoSource(
@@ -516,13 +566,33 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    await _clearPreparedVideo();
+    final canReuseActive =
+        _mode == _Mode.video &&
+        _activeVideoSource == source &&
+        (loopSingle || _expectVideoCompleted);
+    if (canReuseActive) {
+      final player = _players[_activeVideoIndex];
+      await player.setPlaylistMode(
+        loopSingle ? PlaylistMode.single : PlaylistMode.none,
+      );
+      await player.setVolume(100);
+      await player.play();
+      _expectVideoCompleted = !loopSingle;
+      return;
+    }
+
+    if (_mode == _Mode.video) {
+      await _switchToVideoOnStandby(source, loopSingle: loopSingle);
+      return;
+    }
+
     await _openVideoOnPlayer(
       _activeVideoIndex,
       source,
       play: true,
       playlistMode: loopSingle ? PlaylistMode.single : PlaylistMode.none,
     );
+    _activeVideoSource = source;
     _expectVideoCompleted = !loopSingle;
   }
 
@@ -550,6 +620,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _imageTimer?.cancel();
     _expectVideoCompleted = false;
     _preparedVideo = null;
+    _activeVideoSource = null;
     for (final player in _players) {
       try {
         await player.pause();
@@ -840,13 +911,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: _mode == _Mode.image && _imagePath.isNotEmpty
                 ? _buildImageView()
                 : _mode == _Mode.video
-                ? SizedBox.expand(
-                    child: Video(
-                      key: ValueKey('video-$_activeVideoIndex'),
-                      controller: _activeVideoController,
-                      fit: BoxFit.contain,
-                    ),
-                  )
+                ? _buildVideoView()
                 : const SizedBox.shrink(),
           ),
 
