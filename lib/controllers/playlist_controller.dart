@@ -49,7 +49,7 @@ class PlaylistController extends GetxController {
   bool _manifestInFlight = false;
   final _rng = Random();
 
-  static const Duration _manifestBaseInterval = Duration(seconds: 30);
+  static const Duration _manifestBaseInterval = Duration(seconds: 5);
   static const Duration _heartbeatInterval = Duration(seconds: 25);
   static const List<int> _manifestBackoffSeconds = [2, 5, 10, 20, 30];
 
