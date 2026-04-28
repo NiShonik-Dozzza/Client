@@ -26,6 +26,7 @@ class PlaylistController extends GetxController {
   final RxString _serverAddress = ''.obs;
   final RxString _deviceDisplayName = ''.obs;
   final RxBool _setupBusy = false.obs;
+  final RxString _syncDiagnostics = ''.obs;
   final RxBool isOfflineMode = false.obs;
 
   final RxList<PlaylistItem> localItems = <PlaylistItem>[].obs;
@@ -48,7 +49,7 @@ class PlaylistController extends GetxController {
   bool _manifestInFlight = false;
   final _rng = Random();
 
-  static const Duration _manifestBaseInterval = Duration(seconds: 30);
+  static const Duration _manifestBaseInterval = Duration(seconds: 5);
   static const Duration _heartbeatInterval = Duration(seconds: 25);
   static const List<int> _manifestBackoffSeconds = [2, 5, 10, 20, 30];
 
@@ -57,6 +58,7 @@ class PlaylistController extends GetxController {
   String get setupMessage => _setupMessage.value;
   String get serverAddress => _serverAddress.value;
   String get deviceDisplayName => _deviceDisplayName.value;
+  String get syncDiagnostics => _syncDiagnostics.value;
   bool get setupBusy => _setupBusy.value;
   bool get isReady => _setupStage.value == DeviceSetupStage.ready;
   bool get isPendingApproval =>
@@ -287,6 +289,17 @@ class PlaylistController extends GetxController {
         return;
       }
 
+      if (status.isExpired || status.isRevoked) {
+        _auth = auth.copyWith(token: '', requestToken: '');
+        await _deviceStore.save(_auth!);
+        _setSetupRequired(
+          status.message.isNotEmpty
+              ? status.message
+              : 'Заявка больше не действительна. Отправьте новую заявку на регистрацию.',
+        );
+        return;
+      }
+
       _setPendingApproval(
         status.message.isNotEmpty
             ? status.message
@@ -297,6 +310,22 @@ class PlaylistController extends GetxController {
           seconds: status.pollAfterSeconds > 0 ? status.pollAfterSeconds : 5,
         ),
       );
+    } on ApiException catch (e) {
+      await AppLogger.log('registration status failed: $e');
+      if (e.statusCode == 404 || e.statusCode == 409) {
+        _auth = auth.copyWith(token: '', requestToken: '');
+        await _deviceStore.save(_auth!);
+        _setSetupRequired(
+          e.statusCode == 409
+              ? 'Токен подтверждения уже был выдан. Отправьте новую заявку на привязку.'
+              : 'Заявка на привязку не найдена. Отправьте новую заявку.',
+        );
+        return;
+      }
+      _setPendingApproval(
+        'Сервер временно недоступен. Повторю проверку автоматически.',
+      );
+      _scheduleRegistrationPoll(const Duration(seconds: 10));
     } catch (e) {
       await AppLogger.log('registration status failed: $e');
       _setPendingApproval(
@@ -516,12 +545,18 @@ class PlaylistController extends GetxController {
             ? 'api-refresh'
             : 'api',
       );
+      if (manifest.items.isEmpty) {
+        await AppLogger.log(
+          'Manifest is empty: rev=${manifest.revision} media=${manifest.media.length} playlists=${manifest.playlists.length}',
+        );
+      }
       await _manifestStore.save(manifest);
       _prefetchMedia(manifest);
     } on ApiException catch (e) {
       _manifestFailures++;
+      _syncDiagnostics.value = 'manifest error ${e.statusCode}';
       await AppLogger.log('manifest fetch failed: $e');
-      if (e.statusCode == 401 || e.statusCode == 404) {
+      if (e.statusCode == 401 || e.statusCode == 403 || e.statusCode == 404) {
         await _handleAuthLoss('manifest ${e.statusCode}');
       }
     } catch (e) {
@@ -536,6 +571,8 @@ class PlaylistController extends GetxController {
   void _setManifest(Manifest manifest, {required String source}) {
     _manifest = manifest;
     version.value++;
+    _syncDiagnostics.value =
+        'manifest=$source rev=${manifest.revision} items=${manifest.items.length} media=${manifest.media.length} playlists=${manifest.playlists.length}';
     unawaited(
       AppLogger.log(
         'Manifest updated ($source): rev=${manifest.revision} items=${manifest.items.length}',
@@ -622,7 +659,8 @@ class PlaylistController extends GetxController {
       );
     } on ApiException catch (e) {
       await AppLogger.log('heartbeat failed: $e');
-      if (e.statusCode == 401 || e.statusCode == 404) {
+      _syncDiagnostics.value = 'heartbeat error ${e.statusCode}';
+      if (e.statusCode == 401 || e.statusCode == 403 || e.statusCode == 404) {
         await _handleAuthLoss('heartbeat ${e.statusCode}');
       }
     } catch (e) {
@@ -663,7 +701,7 @@ class PlaylistController extends GetxController {
 
   Future<void> _repairServerAddressIfNeeded() async {
     final current = _serverAddress.value;
-    if (!_shouldTryHttp443Fallback(current)) {
+    if (!_shouldTryHttpPortFallback(current)) {
       return;
     }
 
@@ -711,22 +749,24 @@ class PlaylistController extends GetxController {
 
   List<String> _serverCandidates(String normalized) {
     final candidates = <String>[normalized];
-    if (!_shouldTryHttp443Fallback(normalized)) {
+    if (!_shouldTryHttpPortFallback(normalized)) {
       return candidates;
     }
 
     final uri = Uri.parse(normalized);
-    final fallback = uri
-        .replace(port: 443)
-        .toString()
-        .replaceFirst(RegExp(r'/$'), '');
-    if (!candidates.contains(fallback)) {
-      candidates.add(fallback);
+    for (final fallbackPort in [8088, 443]) {
+      final fallback = uri
+          .replace(port: fallbackPort)
+          .toString()
+          .replaceFirst(RegExp(r'/$'), '');
+      if (!candidates.contains(fallback)) {
+        candidates.add(fallback);
+      }
     }
     return candidates;
   }
 
-  bool _shouldTryHttp443Fallback(String value) {
+  bool _shouldTryHttpPortFallback(String value) {
     final normalized = _normalizeServerAddress(value);
     if (normalized.isEmpty) return false;
     final uri = Uri.tryParse(normalized);

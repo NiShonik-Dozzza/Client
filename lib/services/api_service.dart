@@ -90,6 +90,8 @@ class DeviceRegistrationStatus {
 
   bool get isApproved => status == 'approved';
   bool get isRejected => status == 'rejected';
+  bool get isExpired => status == 'expired';
+  bool get isRevoked => status == 'revoked';
 }
 
 class ApiService {
