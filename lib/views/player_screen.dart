@@ -21,6 +21,9 @@ enum _Mode { image, video, black }
 
 enum _PlaybackContext { slotMedia, playlistItem }
 
+const Duration _scheduleBridgeTolerance = Duration(seconds: 2);
+const Duration _playlistVideoDeadlineGrace = Duration(milliseconds: 250);
+
 class _PreparedVideo {
   const _PreparedVideo({
     required this.playerIndex,
@@ -45,8 +48,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   late final List<Player> _players;
   late final List<VideoController> _videoControllers;
+  late final List<bool> _playerBuffering;
+  late final List<bool> _playerPlaying;
+  late final List<Duration> _playerPositions;
+  late final List<Duration> _playerDurations;
+  late final List<Duration> _playerBuffers;
+  late final List<int?> _playerWidths;
+  late final List<int?> _playerHeights;
+  late final List<String?> _playerLastErrors;
+  late final List<Duration> _lastObservedPositions;
+  late final List<DateTime?> _playerLastProgressAt;
   int _activeVideoIndex = 0;
   _PreparedVideo? _preparedVideo;
+  String? _activeVideoSource;
+  int _playbackTraceSeq = 0;
+  int _activePlaybackTraceId = 0;
+  int _lastPlaybackTraceSecond = -1;
+  bool _playbackTraceStallLogged = false;
 
   // ===== ДОБАВЛЕНО: поддержка редактора =====
   bool _isEditorOpen = false; // Отслеживает открыт ли редактор
@@ -57,9 +75,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Timer? _slotTimer; // точный переход на end_time
   Timer? _imageTimer;
   Timer? _debugTimer;
+  Timer? _playbackTraceTimer;
+  Timer? _playlistVideoDeadlineTimer;
 
   bool _initialized = false;
   bool _isDisposed = false;
+  DateTime? _playlistVideoDeadlineAt;
+  Duration? _playlistVideoDeadlineRequested;
 
   ManifestItem? _currentSlot;
   ManifestMedia? _currentMedia;
@@ -82,6 +104,249 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _videoControllers[_activeVideoIndex];
   int get _standbyVideoIndex => _activeVideoIndex == 0 ? 1 : 0;
   Player get _standbyPlayer => _players[_standbyVideoIndex];
+
+  String _formatTc(Duration? value) {
+    if (value == null) return '--:--:--.---';
+    final abs = value.abs();
+    final hours = abs.inHours.toString().padLeft(2, '0');
+    final minutes = (abs.inMinutes % 60).toString().padLeft(2, '0');
+    final seconds = (abs.inSeconds % 60).toString().padLeft(2, '0');
+    final milliseconds =
+        (abs.inMilliseconds % 1000).toString().padLeft(3, '0');
+    final sign = value.isNegative ? '-' : '';
+    return '$sign$hours:$minutes:$seconds.$milliseconds';
+  }
+
+  String _tcLabel(Duration? position, Duration? duration) {
+    return '${_formatTc(position)}/${_formatTc(duration)}';
+  }
+
+  String _sourceLabel(String? source) {
+    if (source == null || source.trim().isEmpty) return '-';
+    final normalized = source.trim();
+    final basename = p.basename(normalized);
+    return basename.isNotEmpty ? basename : normalized;
+  }
+
+  String _slotLabel(ManifestItem? slot) {
+    if (slot == null) return '-';
+    return '${slot.contentType.name}:${slot.contentId} event=${slot.eventId ?? "-"}@${_formatDebugTime(slot.startTime)}..${_formatDebugTime(slot.endTime)} loop=${slot.loopMode.name} prio=${slot.priority}';
+  }
+
+  String _playlistItemLabel(ManifestPlaylistItem? item) {
+    if (item == null) return '-';
+    return 'item:${item.id} media=${item.mediaId} pos=${item.position} dur=${item.durationSec}s';
+  }
+
+  String _mediaLabel(ManifestMedia? media) {
+    if (media == null) return '-';
+    final type = media.isVideo
+        ? 'video'
+        : media.isImage
+        ? 'image'
+        : media.contentType;
+    return '$type:${media.id}:${media.safeBaseName}';
+  }
+
+  String _playerSizeLabel(int playerIndex) {
+    final width = _playerWidths[playerIndex];
+    final height = _playerHeights[playerIndex];
+    if (width == null || height == null) return '-';
+    return '${width}x$height';
+  }
+
+  void _resetPlayerTraceState(int playerIndex) {
+    _playerLastErrors[playerIndex] = null;
+    _playerPositions[playerIndex] = Duration.zero;
+    _playerDurations[playerIndex] = Duration.zero;
+    _playerBuffers[playerIndex] = Duration.zero;
+    _lastObservedPositions[playerIndex] = Duration.zero;
+    _playerLastProgressAt[playerIndex] = DateTime.now();
+  }
+
+  void _startPlaybackTraceTimer() {
+    _playbackTraceTimer?.cancel();
+    _lastPlaybackTraceSecond = -1;
+    _playbackTraceStallLogged = false;
+    _playbackTraceTimer = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) => _tickPlaybackTrace(),
+    );
+  }
+
+  void _stopPlaybackTraceTimer() {
+    _playbackTraceTimer?.cancel();
+    _playbackTraceTimer = null;
+    _activePlaybackTraceId = 0;
+    _lastPlaybackTraceSecond = -1;
+    _playbackTraceStallLogged = false;
+  }
+
+  void _tickPlaybackTrace() {
+    if (_isDisposed || _mode != _Mode.video || _activePlaybackTraceId == 0) {
+      return;
+    }
+
+    final playerIndex = _activeVideoIndex;
+    final position = _playerPositions[playerIndex];
+    final duration = _playerDurations[playerIndex];
+    final buffer = _playerBuffers[playerIndex];
+    final buffering = _playerBuffering[playerIndex];
+    final playing = _playerPlaying[playerIndex];
+    final source = _sourceLabel(_activeVideoSource);
+    final timeBucket = position.inMilliseconds < 0
+        ? -1
+        : position.inMilliseconds ~/ 1000;
+
+    if (timeBucket != _lastPlaybackTraceSecond) {
+      _lastPlaybackTraceSecond = timeBucket;
+      unawaited(
+        AppLogger.log(
+          'playback tick trace=$_activePlaybackTraceId source=$source tc=${_tcLabel(position, duration)} buffer=${_formatTc(buffer)} playing=$playing buffering=$buffering size=${_playerSizeLabel(playerIndex)} slot=${_slotLabel(_currentSlot)} item=${_playlistItemLabel(_currentPlaylistItem)}',
+        ),
+      );
+    }
+
+    final lastProgressAt = _playerLastProgressAt[playerIndex];
+    if (lastProgressAt == null) return;
+
+    final stalledFor = DateTime.now().difference(lastProgressAt);
+    final remaining = duration > position ? duration - position : Duration.zero;
+    final nearTail =
+        duration > Duration.zero &&
+        remaining <= const Duration(milliseconds: 1500);
+
+    if ((playing || buffering) &&
+        stalledFor >= const Duration(milliseconds: 1200) &&
+        !_playbackTraceStallLogged) {
+      _playbackTraceStallLogged = true;
+      unawaited(
+        AppLogger.log(
+          'playback stall trace=$_activePlaybackTraceId source=$source tc=${_tcLabel(position, duration)} buffer=${_formatTc(buffer)} stalled=${stalledFor.inMilliseconds}ms playing=$playing buffering=$buffering near_tail=$nearTail size=${_playerSizeLabel(playerIndex)} error=${_playerLastErrors[playerIndex] ?? "-"}',
+        ),
+      );
+      return;
+    }
+
+    if (stalledFor < const Duration(milliseconds: 500)) {
+      _playbackTraceStallLogged = false;
+    }
+  }
+
+  void _clearPlaylistVideoDeadline() {
+    _playlistVideoDeadlineTimer?.cancel();
+    _playlistVideoDeadlineTimer = null;
+    _playlistVideoDeadlineAt = null;
+    _playlistVideoDeadlineRequested = null;
+  }
+
+  Duration? _remainingPlaylistVideoDeadline() {
+    final deadline = _playlistVideoDeadlineAt;
+    if (deadline == null) return null;
+    final remaining = deadline.difference(DateTime.now());
+    return remaining.isNegative ? Duration.zero : remaining;
+  }
+
+  void _schedulePlaylistVideoDeadline() {
+    final item = _currentPlaylistItem;
+    final slot = _currentSlot;
+    if (_context != _PlaybackContext.playlistItem || item == null || slot == null) {
+      _clearPlaylistVideoDeadline();
+      return;
+    }
+
+    var duration = Duration(seconds: item.durationSec);
+    final slotLeft = slot.endTime.difference(DateTime.now());
+    if (slotLeft.isNegative || slotLeft == Duration.zero) {
+      _clearPlaylistVideoDeadline();
+      unawaited(_applySchedule(force: true));
+      return;
+    }
+    if (slotLeft < duration) {
+      duration = slotLeft;
+    }
+
+    _playlistVideoDeadlineTimer?.cancel();
+    _playlistVideoDeadlineTimer = null;
+    _playlistVideoDeadlineAt = null;
+    _playlistVideoDeadlineRequested = duration;
+    _tryArmPlaylistVideoDeadline(trigger: 'schedule');
+  }
+
+  void _tryArmPlaylistVideoDeadline({required String trigger}) {
+    final requested = _playlistVideoDeadlineRequested;
+    final item = _currentPlaylistItem;
+    final slot = _currentSlot;
+    if (requested == null ||
+        _context != _PlaybackContext.playlistItem ||
+        item == null ||
+        slot == null) {
+      return;
+    }
+    if (_playlistVideoDeadlineAt != null) return;
+    if (!_playerPlaying[_activeVideoIndex] || _playerBuffering[_activeVideoIndex]) {
+      return;
+    }
+
+    var duration = requested;
+    final slotLeft = slot.endTime.difference(DateTime.now());
+    if (slotLeft.isNegative || slotLeft == Duration.zero) {
+      _clearPlaylistVideoDeadline();
+      unawaited(_applySchedule(force: true));
+      return;
+    }
+    if (slotLeft < duration) {
+      duration = slotLeft;
+    }
+
+    _playlistVideoDeadlineAt = DateTime.now().add(duration);
+    _playlistVideoDeadlineRequested = null;
+    unawaited(
+      AppLogger.log(
+        'playlist video deadline armed: trace=$_activePlaybackTraceId trigger=$trigger duration=${duration.inMilliseconds}ms slot_left=${slotLeft.inMilliseconds}ms item=${_playlistItemLabel(item)} slot=${_slotLabel(slot)} media_tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+      ),
+    );
+    _playlistVideoDeadlineTimer = Timer(duration, () {
+      if (_isDisposed || _context != _PlaybackContext.playlistItem) return;
+      final remaining = _remainingPlaylistVideoDeadline() ?? Duration.zero;
+      unawaited(
+        AppLogger.log(
+          'playlist video deadline fired: trace=$_activePlaybackTraceId remaining=${remaining.inMilliseconds}ms item=${_playlistItemLabel(_currentPlaylistItem)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+        ),
+      );
+      _clearPlaylistVideoDeadline();
+      _expectVideoCompleted = false;
+      unawaited(_onPlaylistItemCompleted(reason: 'video-deadline'));
+    });
+  }
+
+  Future<void> _restartPlaylistVideoWithinDeadline() async {
+    final source = _activeVideoSource;
+    if (source == null || _mode != _Mode.video) {
+      await _onPlaylistItemCompleted(reason: 'video-restart-no-source');
+      return;
+    }
+
+    final remaining = _remainingPlaylistVideoDeadline() ?? Duration.zero;
+    await AppLogger.log(
+      'playlist video restart: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} remaining=${remaining.inMilliseconds}ms tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+    );
+
+    try {
+      final player = _players[_activeVideoIndex];
+      await player.seek(Duration.zero);
+      await player.play();
+      _expectVideoCompleted = true;
+      _playerLastProgressAt[_activeVideoIndex] = DateTime.now();
+      _playbackTraceStallLogged = false;
+    } catch (e) {
+      _expectVideoCompleted = false;
+      await AppLogger.log(
+        'playlist video restart failed: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} error=$e',
+      );
+      await _onPlaylistItemCompleted(reason: 'video-restart-failed');
+    }
+  }
 
   Widget _buildImageView() {
     final imageKey = ValueKey(_imagePath);
@@ -127,17 +392,117 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _videoControllers = _players
         .map(VideoController.new)
         .toList(growable: false);
+    _playerBuffering = List<bool>.filled(_players.length, false, growable: false);
+    _playerPlaying = List<bool>.filled(_players.length, false, growable: false);
+    _playerPositions = List<Duration>.filled(
+      _players.length,
+      Duration.zero,
+      growable: false,
+    );
+    _playerDurations = List<Duration>.filled(
+      _players.length,
+      Duration.zero,
+      growable: false,
+    );
+    _playerBuffers = List<Duration>.filled(
+      _players.length,
+      Duration.zero,
+      growable: false,
+    );
+    _playerWidths = List<int?>.filled(_players.length, null, growable: false);
+    _playerHeights = List<int?>.filled(_players.length, null, growable: false);
+    _playerLastErrors = List<String?>.filled(
+      _players.length,
+      null,
+      growable: false,
+    );
+    _lastObservedPositions = List<Duration>.filled(
+      _players.length,
+      Duration.zero,
+      growable: false,
+    );
+    _playerLastProgressAt = List<DateTime?>.filled(
+      _players.length,
+      null,
+      growable: false,
+    );
 
     for (var i = 0; i < _players.length; i++) {
+      _players[i].stream.playing.listen((value) {
+        _playerPlaying[i] = value;
+        if (i == _activeVideoIndex || value) {
+          unawaited(
+            AppLogger.log(
+              'media_kit[$i] playing=$value trace=$_activePlaybackTraceId source=${_sourceLabel(i == _activeVideoIndex ? _activeVideoSource : _preparedVideo?.source)} tc=${_tcLabel(_playerPositions[i], _playerDurations[i])}',
+            ),
+          );
+        }
+        if (i == _activeVideoIndex && value) {
+          _tryArmPlaylistVideoDeadline(trigger: 'playing');
+        }
+      });
+      _players[i].stream.position.listen((value) {
+        final previous = _lastObservedPositions[i];
+        if (value > previous) {
+          _playerLastProgressAt[i] = DateTime.now();
+          if (i == _activeVideoIndex) {
+            _playbackTraceStallLogged = false;
+            _tryArmPlaylistVideoDeadline(trigger: 'progress');
+          }
+        } else if (i == _activeVideoIndex &&
+            value + const Duration(milliseconds: 450) < previous) {
+          unawaited(
+            AppLogger.log(
+              'media_kit[$i] position-rewind trace=$_activePlaybackTraceId source=${_sourceLabel(_activeVideoSource)} from=${_formatTc(previous)} to=${_formatTc(value)}',
+            ),
+          );
+        }
+        _lastObservedPositions[i] = value;
+        _playerPositions[i] = value;
+      });
+      _players[i].stream.duration.listen((value) {
+        _playerDurations[i] = value;
+      });
+      _players[i].stream.buffer.listen((value) {
+        _playerBuffers[i] = value;
+      });
+      _players[i].stream.width.listen((value) {
+        _playerWidths[i] = value;
+      });
+      _players[i].stream.height.listen((value) {
+        _playerHeights[i] = value;
+      });
+      _players[i].stream.buffering.listen((value) {
+        _playerBuffering[i] = value;
+        if (i == _activeVideoIndex || value) {
+          unawaited(
+            AppLogger.log(
+              'media_kit[$i] buffering=$value trace=$_activePlaybackTraceId source=${_sourceLabel(i == _activeVideoIndex ? _activeVideoSource : _preparedVideo?.source)} tc=${_tcLabel(_playerPositions[i], _playerDurations[i])} buffer=${_formatTc(_playerBuffers[i])}',
+            ),
+          );
+        }
+        if (i == _activeVideoIndex && !value) {
+          _tryArmPlaylistVideoDeadline(trigger: 'buffering-false');
+        }
+      });
       _players[i].stream.error.listen(
-        (e) => unawaited(AppLogger.log('media_kit[$i] error: $e')),
+        (e) {
+          _playerLastErrors[i] = e;
+          unawaited(AppLogger.log('media_kit[$i] error: $e'));
+        },
       );
 
-      _players[i].stream.completed.listen((_) {
+      _players[i].stream.completed.listen((completed) {
+        unawaited(
+          AppLogger.log(
+            'media_kit[$i] completed=$completed trace=$_activePlaybackTraceId source=${_sourceLabel(i == _activeVideoIndex ? _activeVideoSource : _preparedVideo?.source)} tc=${_tcLabel(_playerPositions[i], _playerDurations[i])}',
+          ),
+        );
         if (_isDisposed) return;
         if (i != _activeVideoIndex) return;
         if (!_expectVideoCompleted) return;
         if (_mode != _Mode.video) return;
+        if (!completed) return;
 
         _expectVideoCompleted = false;
         _onVideoCompleted();
@@ -184,6 +549,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _tick?.cancel();
     _slotTimer?.cancel();
     _imageTimer?.cancel();
+    _clearPlaylistVideoDeadline();
     _expectVideoCompleted = false;
 
     await _stopEverything();
@@ -215,7 +581,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final controller = Get.find<PlaylistController>();
 
       // реагируем на обновление манифеста
-      ever<int>(controller.version, (_) => _applySchedule(force: true));
+      ever<int>(controller.version, (_) {
+        unawaited(
+          AppLogger.log(
+            'schedule apply requested: revision=${controller.currentRevision} items=${controller.items.length} mode=${controller.isOfflineMode.value ? "offline" : "online"}',
+          ),
+        );
+        _applySchedule(force: true);
+      });
 
       setState(() => _initialized = true);
 
@@ -252,7 +625,26 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final nextSlot = controller.currentSlot(now);
 
     if (nextSlot == null) {
+      final continuation = _findUpcomingContinuationSlot(controller, now);
+      if (continuation != null) {
+        _slotTimer?.cancel();
+        final wait = continuation.startTime.difference(now);
+        if (!wait.isNegative) {
+          _slotTimer = Timer(wait, () => _applySchedule(force: true));
+        }
+        await AppLogger.log(
+          'schedule bridge keep: force=$force from=${_slotLabel(_currentSlot)} to=${_slotLabel(continuation)} wait=${wait.inMilliseconds}ms media=${_mediaLabel(_currentMedia)} item=${_playlistItemLabel(_currentPlaylistItem)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+        );
+        if (mounted) {
+          setState(() {});
+        }
+        return;
+      }
+
       if (_currentSlot != null) {
+        await AppLogger.log(
+          'schedule clear: prev_slot=${_slotLabel(_currentSlot)} prev_media=${_mediaLabel(_currentMedia)} prev_item=${_playlistItemLabel(_currentPlaylistItem)}',
+        );
         await _stopEverything();
         setState(() {
           _currentSlot = null;
@@ -267,8 +659,40 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    final same = !force && _isSameSlot(_currentSlot, nextSlot);
-    if (same) return;
+    final exactSame = !force && _isSameSlot(_currentSlot, nextSlot);
+    if (exactSame) return;
+
+    final sameLogical = _isSameLogicalSlotAt(_currentSlot, nextSlot, now);
+    if (sameLogical) {
+      final previousSlot = _currentSlot;
+      _currentSlot = nextSlot;
+      if (nextSlot.contentType == ManifestContentType.playlist &&
+          _currentPlaylist?.id == nextSlot.contentId) {
+        _currentPlaylist = controller.playlistById(nextSlot.contentId);
+      } else if (nextSlot.contentType == ManifestContentType.media &&
+          _currentMedia?.id == nextSlot.contentId) {
+        _currentMedia = controller.mediaById(nextSlot.contentId) ?? _currentMedia;
+      }
+
+      _slotTimer?.cancel();
+      final updatedDuration = nextSlot.endTime.difference(now);
+      if (!updatedDuration.isNegative) {
+        _slotTimer = Timer(updatedDuration, () => _applySchedule(force: true));
+      }
+
+      await AppLogger.log(
+        'schedule keep active slot: force=$force from=${_slotLabel(previousSlot)} to=${_slotLabel(nextSlot)} media=${_mediaLabel(_currentMedia)} item=${_playlistItemLabel(_currentPlaylistItem)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+      );
+
+      if (mounted) {
+        setState(() {});
+      }
+      return;
+    }
+
+    await AppLogger.log(
+      'schedule switch: force=$force from=${_slotLabel(_currentSlot)} to=${_slotLabel(nextSlot)} prev_media=${_mediaLabel(_currentMedia)} prev_item=${_playlistItemLabel(_currentPlaylistItem)} active_source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+    );
 
     _currentSlot = nextSlot;
     _currentMedia = null;
@@ -308,6 +732,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     _currentPlaylist = playlist;
     await _playPlaylistIndex(0);
+  }
+
+  ManifestItem? _findUpcomingContinuationSlot(
+    PlaylistController controller,
+    DateTime now,
+  ) {
+    final currentSlot = _currentSlot;
+    if (currentSlot == null) return null;
+
+    ManifestItem? candidate;
+    for (final item in controller.items) {
+      if (!_isSameSlotIdentity(currentSlot, item)) continue;
+      if (item.loopMode != currentSlot.loopMode ||
+          item.priority != currentSlot.priority) {
+        continue;
+      }
+      if (item.endTime.isBefore(now)) continue;
+
+      final wait = item.startTime.difference(now);
+      if (wait.isNegative || wait > _scheduleBridgeTolerance) continue;
+
+      if (candidate == null || item.startTime.isBefore(candidate.startTime)) {
+        candidate = item;
+      }
+    }
+    return candidate;
   }
 
   // ===== НОВЫЙ МЕТОД: обработка оффлайн-режима =====
@@ -463,6 +913,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     required PlaylistMode playlistMode,
   }) async {
     final player = _players[playerIndex];
+    _resetPlayerTraceState(playerIndex);
     await player.setPlaylistMode(playlistMode);
     await player.setVolume(play ? 100 : 0);
     await player.open(Playlist([Media(source)]), play: play);
@@ -484,6 +935,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final previousActive = _activeVideoIndex;
     _activeVideoIndex = prepared.playerIndex;
     _preparedVideo = null;
+    _activeVideoSource = source;
+    _resetPlayerTraceState(_activeVideoIndex);
+
+    await AppLogger.log(
+      'video activate prepared: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prev_player=$previousActive loop_single=$loopSingle prepared_media=${prepared.mediaId}',
+    );
 
     await _players[_activeVideoIndex].setPlaylistMode(
       loopSingle ? PlaylistMode.single : PlaylistMode.none,
@@ -498,6 +955,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } catch (_) {}
 
     _expectVideoCompleted = !loopSingle;
+    _startPlaybackTraceTimer();
+    await AppLogger.log(
+      'video active: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prepared=true loop_single=$loopSingle size=${_playerSizeLabel(_activeVideoIndex)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+    );
     if (mounted) {
       setState(() => _mode = _Mode.video);
     }
@@ -508,6 +969,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     String source, {
     required bool loopSingle,
   }) async {
+    await AppLogger.log(
+      'video source request: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} loop_single=$loopSingle active_player=$_activeVideoIndex standby_player=$_standbyVideoIndex prepared_match=${_preparedVideo?.source == source}',
+    );
     final activated = await _activatePreparedVideoIfMatches(
       source,
       loopSingle: loopSingle,
@@ -523,15 +987,26 @@ class _PlayerScreenState extends State<PlayerScreen> {
       play: true,
       playlistMode: loopSingle ? PlaylistMode.single : PlaylistMode.none,
     );
+    _activeVideoSource = source;
     _expectVideoCompleted = !loopSingle;
+    _startPlaybackTraceTimer();
+    await AppLogger.log(
+      'video active: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prepared=false loop_single=$loopSingle size=${_playerSizeLabel(_activeVideoIndex)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+    );
   }
 
   Future<void> _prepareVideoOnStandby(String source, int mediaId) async {
     final prepared = _preparedVideo;
     if (prepared != null && prepared.source == source) {
+      await AppLogger.log(
+        'video prepare skip: source=${_sourceLabel(source)} media_id=$mediaId standby_player=${prepared.playerIndex}',
+      );
       return;
     }
 
+    await AppLogger.log(
+      'video prepare start: source=${_sourceLabel(source)} media_id=$mediaId standby_player=$_standbyVideoIndex',
+    );
     await _clearPreparedVideo();
     await _openVideoOnPlayer(
       _standbyVideoIndex,
@@ -544,11 +1019,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
       source: source,
       mediaId: mediaId,
     );
+    await AppLogger.log(
+      'video prepare ready: source=${_sourceLabel(source)} media_id=$mediaId standby_player=$_standbyVideoIndex',
+    );
   }
 
   Future<void> _stopEverything() async {
     _imageTimer?.cancel();
+    _clearPlaylistVideoDeadline();
     _expectVideoCompleted = false;
+    if (_mode == _Mode.video ||
+        _activeVideoSource != null ||
+        _preparedVideo != null) {
+      await AppLogger.log(
+        'stop playback: trace=$_activePlaybackTraceId active_source=${_sourceLabel(_activeVideoSource)} prepared_source=${_sourceLabel(_preparedVideo?.source)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+      );
+    }
+    _stopPlaybackTraceTimer();
+    _activeVideoSource = null;
     _preparedVideo = null;
     for (final player in _players) {
       try {
@@ -568,17 +1056,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final controller = Get.find<PlaylistController>();
     final file = await controller.ensureMediaFile(media);
     if (file == null) {
+      await AppLogger.log(
+        'media file unavailable: context=${context.name} slot=${_slotLabel(slotContext)} item=${_playlistItemLabel(_currentPlaylistItem)} media=${_mediaLabel(media)}',
+      );
       await _stopEverything();
       setState(() => _mode = _Mode.black);
       return;
     }
-    if (!_isSameSlot(_currentSlot, slotContext)) return;
+    if (!_matchesPlaybackSlot(_currentSlot, slotContext)) {
+      await AppLogger.log(
+        'play media aborted: slot changed expected=${_slotLabel(slotContext)} actual=${_slotLabel(_currentSlot)} media=${_mediaLabel(media)} file=${_sourceLabel(file.path)}',
+      );
+      return;
+    }
 
     _context = context;
     _currentMedia = media;
 
     if (media.isImage) {
       await _stopEverything();
+      _activePlaybackTraceId = ++_playbackTraceSeq;
+      await AppLogger.log(
+        'playback trace start: trace=$_activePlaybackTraceId context=${context.name} slot=${_slotLabel(slotContext)} item=${_playlistItemLabel(_currentPlaylistItem)} media=${_mediaLabel(media)} file=${_sourceLabel(file.path)}',
+      );
       setState(() {
         _mode = _Mode.image;
         _imageIsFile = true;
@@ -589,11 +1089,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _armPlaylistImageTimer();
       }
 
-      await AppLogger.log('SHOW IMAGE: ${media.safeBaseName}');
+      await AppLogger.log(
+        'SHOW IMAGE: ${media.safeBaseName} trace=$_activePlaybackTraceId slot=${_slotLabel(slotContext)} item=${_playlistItemLabel(_currentPlaylistItem)}',
+      );
       return;
     }
 
     if (media.isVideo) {
+      _activePlaybackTraceId = ++_playbackTraceSeq;
+      _lastPlaybackTraceSecond = -1;
+      _playbackTraceStallLogged = false;
+      await AppLogger.log(
+        'playback trace start: trace=$_activePlaybackTraceId context=${context.name} slot=${_slotLabel(slotContext)} item=${_playlistItemLabel(_currentPlaylistItem)} media=${_mediaLabel(media)} file=${_sourceLabel(file.path)}',
+      );
       try {
         setState(() => _mode = _Mode.video);
         await _playVideoSource(
@@ -603,12 +1111,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
               slotContext.loopMode == ManifestLoopMode.fill,
         );
         await AppLogger.log(
-          'PLAY VIDEO: ${media.safeBaseName} src=${file.path}',
+          'PLAY VIDEO: ${media.safeBaseName} trace=$_activePlaybackTraceId src=${file.path} slot=${_slotLabel(slotContext)} item=${_playlistItemLabel(_currentPlaylistItem)}',
         );
+        if (context == _PlaybackContext.playlistItem) {
+          _schedulePlaylistVideoDeadline();
+        } else {
+          _clearPlaylistVideoDeadline();
+        }
       } catch (e) {
         _expectVideoCompleted = false;
+        _clearPlaylistVideoDeadline();
         await AppLogger.log(
-          'VIDEO OPEN FAILED: ${media.safeBaseName} error=$e',
+          'VIDEO OPEN FAILED: ${media.safeBaseName} trace=$_activePlaybackTraceId error=$e',
         );
         setState(() => _mode = _Mode.black);
       }
@@ -638,11 +1152,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     _imageTimer?.cancel();
-    _imageTimer = Timer(duration, _onPlaylistItemCompleted);
+    unawaited(
+      AppLogger.log(
+        'playlist image timer armed: trace=$_activePlaybackTraceId duration=${duration.inMilliseconds}ms slot_left=${left.inMilliseconds}ms item=${_playlistItemLabel(item)} slot=${_slotLabel(slot)}',
+      ),
+    );
+    _imageTimer = Timer(
+      duration,
+      () => unawaited(_onPlaylistItemCompleted(reason: 'image-timer')),
+    );
   }
 
   Future<void> _onVideoCompleted() async {
     final controller = Get.find<PlaylistController>();
+    await AppLogger.log(
+      'video completed handler: trace=$_activePlaybackTraceId context=${_context?.name ?? "-"} slot=${_slotLabel(_currentSlot)} item=${_playlistItemLabel(_currentPlaylistItem)} media=${_mediaLabel(_currentMedia)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+    );
 
     // В оффлайн-режиме обрабатываем по-другому
     if (controller.isOfflineMode.value) {
@@ -671,7 +1196,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     // Онлайн-режим (старый код)
     if (_context == _PlaybackContext.playlistItem) {
-      _onPlaylistItemCompleted();
+      final remaining = _remainingPlaylistVideoDeadline();
+      if (remaining != null && remaining > _playlistVideoDeadlineGrace) {
+        await AppLogger.log(
+          'playlist video completed early: trace=$_activePlaybackTraceId remaining=${remaining.inMilliseconds}ms item=${_playlistItemLabel(_currentPlaylistItem)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+        );
+        await _restartPlaylistVideoWithinDeadline();
+        return;
+      }
+      _clearPlaylistVideoDeadline();
+      await _onPlaylistItemCompleted(reason: 'player-completed');
       return;
     }
 
@@ -705,6 +1239,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         continue;
       }
 
+      await AppLogger.log(
+        'playlist select: playlist=${playlist.id}:${playlist.name} index=$i/${playlist.items.length - 1} item=${_playlistItemLabel(item)} media=${_mediaLabel(media)} slot=${_slotLabel(_currentSlot)}',
+      );
       _playlistIndex = i;
       _currentPlaylistItem = item;
       final slot = _currentSlot;
@@ -714,15 +1251,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
         context: _PlaybackContext.playlistItem,
         slotContext: slot,
       );
-      _prepareUpcomingPlayback(playlist, i);
+      unawaited(_prepareUpcomingPlayback(playlist, i));
       return;
     }
 
     setState(() => _mode = _Mode.black);
   }
 
-  void _onPlaylistItemCompleted() {
+  Future<void> _onPlaylistItemCompleted({String reason = 'unknown'}) async {
     final controller = Get.find<PlaylistController>();
+    _clearPlaylistVideoDeadline();
+    await AppLogger.log(
+      'playlist item completed: trace=$_activePlaybackTraceId reason=$reason index=$_playlistIndex item=${_playlistItemLabel(_currentPlaylistItem)} media=${_mediaLabel(_currentMedia)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+    );
 
     // В оффлайн-режиме обрабатываем по-другому
     if (controller.isOfflineMode.value) {
@@ -734,10 +1275,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       // Если элемент ещё активен и зациклен - перезапускаем
       if (item.loop &&
           (item.stopDate == null || now.isBefore(item.stopDate!))) {
-        _playOfflineItem(item);
+        await _playOfflineItem(item);
       } else {
         // Иначе переходим к следующему элементу или чёрному экрану
-        _applySchedule(force: true);
+        await _applySchedule(force: true);
       }
       return;
     }
@@ -748,7 +1289,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (slot == null || playlist == null) return;
 
     if (!slot.isActiveAt(DateTime.now())) {
-      _applySchedule(force: true);
+      await AppLogger.log(
+        'playlist item completed -> schedule reapply: trace=$_activePlaybackTraceId slot=${_slotLabel(slot)}',
+      );
+      await _applySchedule(force: true);
       return;
     }
 
@@ -757,12 +1301,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (slot.loopMode == ManifestLoopMode.fill) {
         nextIndex = 0;
       } else {
+        await AppLogger.log(
+          'playlist end without loop: trace=$_activePlaybackTraceId slot=${_slotLabel(slot)}',
+        );
         setState(() => _mode = _Mode.black);
         return;
       }
     }
 
-    _playPlaylistIndex(nextIndex);
+    await AppLogger.log(
+      'playlist advance: trace=$_activePlaybackTraceId next_index=$nextIndex slot=${_slotLabel(slot)}',
+    );
+    await _playPlaylistIndex(nextIndex);
   }
 
   Future<void> _prepareUpcomingPlayback(
@@ -777,6 +1327,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     var nextIndex = fromIndex + 1;
     if (nextIndex >= playlist.items.length) {
       if (slot.loopMode != ManifestLoopMode.fill) {
+        await AppLogger.log(
+          'prepare upcoming clear: reached playlist end without loop playlist=${playlist.id}:${playlist.name}',
+        );
         await _clearPreparedVideo();
         return;
       }
@@ -786,24 +1339,39 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final item = playlist.items[nextIndex];
     final media = controller.mediaById(item.mediaId);
     if (media == null) {
+      await AppLogger.log(
+        'prepare upcoming missing media: item=${_playlistItemLabel(item)} playlist=${playlist.id}:${playlist.name}',
+      );
       await _clearPreparedVideo();
       return;
     }
 
     if (media.isImage) {
+      await AppLogger.log(
+        'prepare upcoming image: item=${_playlistItemLabel(item)} media=${_mediaLabel(media)}',
+      );
       await _clearPreparedVideo();
       final file = await controller.ensureMediaFile(media);
       if (file == null || !mounted) return;
       await precacheImage(FileImage(file), context);
+      await AppLogger.log(
+        'prepare upcoming image ready: item=${_playlistItemLabel(item)} file=${_sourceLabel(file.path)}',
+      );
       return;
     }
 
     if (media.isVideo) {
       final file = await controller.ensureMediaFile(media);
       if (file == null) {
+        await AppLogger.log(
+          'prepare upcoming video missing file: item=${_playlistItemLabel(item)} media=${_mediaLabel(media)}',
+        );
         await _clearPreparedVideo();
         return;
       }
+      await AppLogger.log(
+        'prepare upcoming video: item=${_playlistItemLabel(item)} media=${_mediaLabel(media)} file=${_sourceLabel(file.path)}',
+      );
       await _prepareVideoOnStandby(file.path, media.id);
       return;
     }
@@ -907,6 +1475,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   'priority=${slot?.priority}\n'
                   'playlistIndex=$_playlistIndex\n'
                   'media=${_currentMedia?.id ?? "-"}\n'
+                  'trace=$_activePlaybackTraceId\n'
+                  'source=${_sourceLabel(_activeVideoSource)}\n'
+                  'tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}\n'
+                  'buffer=${_formatTc(_playerBuffers[_activeVideoIndex])}\n'
+                  'playing=${_playerPlaying[_activeVideoIndex]} buffering=${_playerBuffering[_activeVideoIndex]}\n'
+                  'size=${_playerSizeLabel(_activeVideoIndex)}\n'
                   'expectCompleted=$_expectVideoCompleted\n'
                   'imgIsFile=$_imageIsFile\n'
                   'imgPath=$_imagePath',
@@ -926,6 +1500,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _slotTimer?.cancel();
     _imageTimer?.cancel();
     _debugTimer?.cancel();
+    _playbackTraceTimer?.cancel();
     HardwareKeyboard.instance.removeHandler(_onKey);
     for (final player in _players) {
       player.dispose();
@@ -941,11 +1516,33 @@ String _formatDebugTime(DateTime? value) {
 
 bool _isSameSlot(ManifestItem? a, ManifestItem b) {
   if (a == null) return false;
-  return a.contentId == b.contentId &&
+  return a.eventId == b.eventId &&
+      a.contentId == b.contentId &&
       a.contentType == b.contentType &&
       a.startTime == b.startTime &&
       a.endTime == b.endTime &&
+      a.loopMode == b.loopMode &&
       a.priority == b.priority;
+}
+
+bool _isSameSlotIdentity(ManifestItem? a, ManifestItem b) {
+  if (a == null) return false;
+  if (a.contentType != b.contentType) return false;
+  if (a.eventId != null && b.eventId != null) {
+    return a.eventId == b.eventId;
+  }
+  return a.contentId == b.contentId;
+}
+
+bool _matchesPlaybackSlot(ManifestItem? a, ManifestItem b) {
+  if (_isSameSlot(a, b)) return true;
+  if (!_isSameSlotIdentity(a, b)) return false;
+  return a!.loopMode == b.loopMode && a.priority == b.priority;
+}
+
+bool _isSameLogicalSlotAt(ManifestItem? a, ManifestItem b, DateTime now) {
+  if (!_matchesPlaybackSlot(a, b)) return false;
+  return a!.isActiveAt(now) && b.isActiveAt(now);
 }
 
 String _nowPlayingFor(ManifestItem slot) {

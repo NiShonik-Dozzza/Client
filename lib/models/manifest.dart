@@ -77,6 +77,7 @@ class Manifest {
 }
 
 class ManifestItem {
+  final int? eventId;
   final DateTime startTime;
   final DateTime endTime;
   final ManifestContentType contentType;
@@ -85,6 +86,7 @@ class ManifestItem {
   final int priority;
 
   ManifestItem({
+    required this.eventId,
     required this.startTime,
     required this.endTime,
     required this.contentType,
@@ -98,6 +100,7 @@ class ManifestItem {
     final loopModeRaw = (json['loop_mode'] as String?)?.trim().toLowerCase();
 
     return ManifestItem(
+      eventId: _asNullableInt(json['event_id']),
       startTime: _parseTime(json['start_time'] as String?),
       endTime: _parseTime(json['end_time'] as String?),
       contentType: contentTypeRaw == 'playlist' ? ManifestContentType.playlist : ManifestContentType.media,
@@ -108,6 +111,7 @@ class ManifestItem {
   }
 
   Map<String, dynamic> toJson() => {
+    'event_id': eventId,
     'start_time': startTime.toIso8601String(),
     'end_time': endTime.toIso8601String(),
     'content_type': contentType == ManifestContentType.playlist ? 'playlist' : 'media',
@@ -248,6 +252,14 @@ int _asInt(dynamic value, [int fallback = 0]) {
   if (value is num) return value.toInt();
   if (value is String) return int.tryParse(value.trim()) ?? fallback;
   return fallback;
+}
+
+int? _asNullableInt(dynamic value) {
+  if (value == null) return null;
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value.trim());
+  return null;
 }
 
 DateTime _parseTime(String? raw) {

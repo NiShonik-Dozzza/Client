@@ -66,145 +66,156 @@ class _SetupScreenState extends State<SetupScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6FA),
       body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 720),
-            child: Padding(
+        child: LayoutBuilder(
+          builder: (context, viewportConstraints) {
+            return SingleChildScrollView(
               padding: const EdgeInsets.all(24),
-              child: Obx(() {
-                final pending = _controller.isPendingApproval;
-                final busy = _controller.setupBusy;
-                final cardColor = pending
-                    ? const Color(0xFFF8FBFF)
-                    : Colors.white;
-                return Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Text(
-                      'Первичная настройка устройства',
-                      style: theme.textTheme.headlineSmall?.copyWith(
-                        fontWeight: FontWeight.w700,
-                        color: const Color(0xFF1F2533),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      'Клиент сам инициирует регистрацию. После отправки заявки администратор подтверждает устройство в панели управления.',
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: const Color(0xFF5F6B84),
-                      ),
-                    ),
-                    const SizedBox(height: 24),
-                    Container(
-                      padding: const EdgeInsets.all(24),
-                      decoration: BoxDecoration(
-                        color: cardColor,
-                        borderRadius: BorderRadius.circular(24),
-                        border: Border.all(color: const Color(0xFFD8DFEA)),
-                        boxShadow: const [
-                          BoxShadow(
-                            color: Color(0x14000000),
-                            blurRadius: 24,
-                            offset: Offset(0, 12),
-                          ),
-                        ],
-                      ),
-                      child: Column(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  minHeight: viewportConstraints.maxHeight - 48,
+                ),
+                child: Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 720),
+                    child: Obx(() {
+                      final pending = _controller.isPendingApproval;
+                      final busy = _controller.setupBusy;
+                      final cardColor = pending
+                          ? const Color(0xFFF8FBFF)
+                          : Colors.white;
+                      return Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
-                          _InfoRow(
-                            label: 'ID устройства',
-                            value: _controller.deviceId,
-                          ),
-                          const SizedBox(height: 16),
-                          TextField(
-                            controller: _serverController,
-                            enabled: !busy,
-                            decoration: const InputDecoration(
-                              labelText: 'Адрес сервера',
-                              hintText:
-                                  'Например: 192.168.1.50:443 или http://192.168.1.50:443',
-                              border: OutlineInputBorder(),
+                          Text(
+                            'Первичная настройка устройства',
+                            style: theme.textTheme.headlineSmall?.copyWith(
+                              fontWeight: FontWeight.w700,
+                              color: const Color(0xFF1F2533),
                             ),
                           ),
-                          const SizedBox(height: 16),
-                          TextField(
-                            controller: _nameController,
-                            enabled: !busy,
-                            decoration: const InputDecoration(
-                              labelText: 'Имя устройства',
-                              hintText: 'Например: Экран ресепшн',
-                              border: OutlineInputBorder(),
+                          const SizedBox(height: 10),
+                          Text(
+                            'Клиент сам инициирует регистрацию. После отправки заявки администратор подтверждает устройство в панели управления.',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: const Color(0xFF5F6B84),
                             ),
                           ),
-                          const SizedBox(height: 16),
+                          const SizedBox(height: 24),
                           Container(
-                            padding: const EdgeInsets.all(14),
+                            padding: const EdgeInsets.all(24),
                             decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(16),
-                              border: Border.all(
-                                color: const Color(0xFFD8DFEA),
-                              ),
+                              color: cardColor,
+                              borderRadius: BorderRadius.circular(24),
+                              border: Border.all(color: const Color(0xFFD8DFEA)),
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Color(0x14000000),
+                                  blurRadius: 24,
+                                  offset: Offset(0, 12),
+                                ),
+                              ],
                             ),
-                            child: Text(
-                              _controller.setupMessage,
-                              style: theme.textTheme.bodyMedium?.copyWith(
-                                color: const Color(0xFF374151),
-                              ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                _InfoRow(
+                                  label: 'ID устройства',
+                                  value: _controller.deviceId,
+                                ),
+                                const SizedBox(height: 16),
+                                TextField(
+                                  controller: _serverController,
+                                  enabled: !busy,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Адрес сервера',
+                                    hintText:
+                                        'Например: 192.168.1.50:443 или http://192.168.1.50:443',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                ),
+                                const SizedBox(height: 16),
+                                TextField(
+                                  controller: _nameController,
+                                  enabled: !busy,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Имя устройства',
+                                    hintText: 'Например: Экран ресепшн',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                ),
+                                const SizedBox(height: 16),
+                                Container(
+                                  padding: const EdgeInsets.all(14),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white,
+                                    borderRadius: BorderRadius.circular(16),
+                                    border: Border.all(
+                                      color: const Color(0xFFD8DFEA),
+                                    ),
+                                  ),
+                                  child: Text(
+                                    _controller.setupMessage,
+                                    style: theme.textTheme.bodyMedium?.copyWith(
+                                      color: const Color(0xFF374151),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 20),
+                                Wrap(
+                                  spacing: 12,
+                                  runSpacing: 12,
+                                  alignment: WrapAlignment.end,
+                                  children: [
+                                    OutlinedButton(
+                                      onPressed: busy ? null : _checkConnection,
+                                      child: const Text('Проверить соединение'),
+                                    ),
+                                    if (pending)
+                                      OutlinedButton(
+                                        onPressed: busy ? null : _resetFlow,
+                                        child: const Text('Изменить настройки'),
+                                      ),
+                                    ElevatedButton(
+                                      onPressed: busy
+                                          ? null
+                                          : pending
+                                          ? _refreshStatus
+                                          : _submitRequest,
+                                      child: Text(
+                                        pending
+                                            ? 'Проверить статус'
+                                            : 'Отправить заявку',
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                if (busy) ...[
+                                  const SizedBox(height: 16),
+                                  const Center(
+                                    child: CircularProgressIndicator(),
+                                  ),
+                                ],
+                                if (pending) ...[
+                                  const SizedBox(height: 18),
+                                  Text(
+                                    'После подтверждения клиент автоматически перейдёт к синхронизации и загрузке контента.',
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: const Color(0xFF5F6B84),
+                                    ),
+                                  ),
+                                ],
+                              ],
                             ),
                           ),
-                          const SizedBox(height: 20),
-                          Wrap(
-                            spacing: 12,
-                            runSpacing: 12,
-                            alignment: WrapAlignment.end,
-                            children: [
-                              OutlinedButton(
-                                onPressed: busy ? null : _checkConnection,
-                                child: const Text('Проверить соединение'),
-                              ),
-                              if (pending)
-                                OutlinedButton(
-                                  onPressed: busy ? null : _resetFlow,
-                                  child: const Text('Изменить настройки'),
-                                ),
-                              ElevatedButton(
-                                onPressed: busy
-                                    ? null
-                                    : pending
-                                    ? _refreshStatus
-                                    : _submitRequest,
-                                child: Text(
-                                  pending
-                                      ? 'Проверить статус'
-                                      : 'Отправить заявку',
-                                ),
-                              ),
-                            ],
-                          ),
-                          if (busy) ...[
-                            const SizedBox(height: 16),
-                            const Center(child: CircularProgressIndicator()),
-                          ],
-                          if (pending) ...[
-                            const SizedBox(height: 18),
-                            Text(
-                              'После подтверждения клиент автоматически перейдёт к синхронизации и загрузке контента.',
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                color: const Color(0xFF5F6B84),
-                              ),
-                            ),
-                          ],
                         ],
-                      ),
-                    ),
-                  ],
-                );
-              }),
-            ),
-          ),
+                      );
+                    }),
+                  ),
+                ),
+              ),
+            );
+          },
         ),
       ),
     );

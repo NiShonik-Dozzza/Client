@@ -104,6 +104,9 @@ class PlaylistController extends GetxController {
           ? _auth!.name!
           : _deviceName();
       await _deviceStore.save(_auth!);
+      await AppLogger.log(
+        'boot state: server=${_serverAddress.value} device_id=${_auth?.deviceId ?? "-"} has_token=${_auth?.hasToken ?? false} has_pending=${_auth?.hasPendingRequest ?? false}',
+      );
 
       final cachedManifest = await _manifestStore.read();
       if (cachedManifest != null) {
@@ -335,6 +338,9 @@ class PlaylistController extends GetxController {
   Future<void> _startOnlineSync() async {
     _registrationPollTimer?.cancel();
     _heartbeatTimer?.cancel();
+    await AppLogger.log(
+      'online sync start: device_id=${_auth?.deviceId ?? "-"} server=${_serverAddress.value} revision=$currentRevision',
+    );
     await _fetchManifest();
     _heartbeatTimer = Timer.periodic(
       _heartbeatInterval,
@@ -478,10 +484,18 @@ class PlaylistController extends GetxController {
     final auth = _auth;
     if (api == null || auth == null || !auth.hasToken) return;
 
-    if (_manifestInFlight) return;
+    if (_manifestInFlight) {
+      await AppLogger.log(
+        'manifest fetch skipped: in_flight=true device_id=${auth.deviceId} revision=$currentRevision',
+      );
+      return;
+    }
     _manifestInFlight = true;
 
     try {
+      await AppLogger.log(
+        'manifest fetch start: device_id=${auth.deviceId} revision=$currentRevision token_present=${auth.token.isNotEmpty}',
+      );
       final manifest = await api.fetchManifest(
         deviceId: auth.deviceId,
         token: auth.token,
@@ -490,6 +504,9 @@ class PlaylistController extends GetxController {
       final currentManifest = _manifest;
       if (currentManifest != null &&
           _manifestSignature(currentManifest) == _manifestSignature(manifest)) {
+        await AppLogger.log(
+          'manifest fetch unchanged: device_id=${auth.deviceId} revision=${manifest.revision} items=${manifest.items.length}',
+        );
         return;
       }
 

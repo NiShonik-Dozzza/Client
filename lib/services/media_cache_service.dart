@@ -33,19 +33,35 @@ class MediaCacheService {
 
   Future<File?> ensureMediaFile(ManifestMedia media, String mediaRoot) {
     return _inflight.putIfAbsent(media.id, () async {
+      final startedAt = DateTime.now();
+
       try {
         if (media.downloadUrl.isEmpty) {
           await AppLogger.log('Media download_url missing: id=${media.id}');
           return null;
         }
         final target = await _targetFile(media, mediaRoot);
-        if (await _isValid(target, media)) return target;
+        if (await _isValid(target, media)) {
+          await AppLogger.log(
+            'media cache hit: id=${media.id} name=${media.safeBaseName} elapsed=${DateTime.now().difference(startedAt).inMilliseconds}ms path=${target.path}',
+          );
+          return target;
+        }
+
+        await AppLogger.log(
+          'media cache miss: id=${media.id} name=${media.safeBaseName} elapsed=${DateTime.now().difference(startedAt).inMilliseconds}ms path=${target.path}',
+        );
 
         bool refreshed = false;
         for (var attempt = 0; attempt < _maxDownloadAttempts; attempt++) {
           try {
             final stored = await _downloadAndStore(media, target);
-            if (stored != null) return stored;
+            if (stored != null) {
+              await AppLogger.log(
+                'media cache stored: id=${media.id} name=${media.safeBaseName} attempt=${attempt + 1} elapsed=${DateTime.now().difference(startedAt).inMilliseconds}ms path=${stored.path}',
+              );
+              return stored;
+            }
             throw Exception('download failed: checksum mismatch');
           } on DownloadForbidden {
             if (!refreshed && _onForbidden != null) {
@@ -62,9 +78,14 @@ class MediaCacheService {
             await Future.delayed(_backoffDelay(attempt + 1));
           }
         }
+        await AppLogger.log(
+          'media cache failed: id=${media.id} name=${media.safeBaseName} elapsed=${DateTime.now().difference(startedAt).inMilliseconds}ms',
+        );
         return null;
       } catch (e) {
-        await AppLogger.log('Media cache error id=${media.id}: $e');
+        await AppLogger.log(
+          'Media cache error id=${media.id} elapsed=${DateTime.now().difference(startedAt).inMilliseconds}ms: $e',
+        );
         return null;
       } finally {
         _inflight.remove(media.id);
