@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
@@ -13,6 +14,18 @@ class DownloadForbidden implements Exception {
   String toString() => 'DownloadForbidden(403)';
 }
 
+class MediaCacheDiagnostics {
+  const MediaCacheDiagnostics({
+    required this.cachedMediaCount,
+    required this.cacheSizeBytes,
+    required this.downloadFailures,
+  });
+
+  final int cachedMediaCount;
+  final int cacheSizeBytes;
+  final int downloadFailures;
+}
+
 class MediaCacheService {
   MediaCacheService({
     http.Client? client,
@@ -24,12 +37,49 @@ class MediaCacheService {
 
   final http.Client _client;
   final Map<int, Future<File?>> _inflight = {};
+  final Map<String, Future<Map<int, _ValidatedCacheEntry>>> _validationIndexes =
+      {};
   final Future<void> Function()? _onForbidden;
   final String? Function()? _tokenProvider;
   final _rng = Random();
+  int _downloadFailures = 0;
 
   static const List<int> _downloadBackoffSeconds = [2, 5, 10, 20, 30];
   static const int _maxDownloadAttempts = 5;
+
+  Future<MediaCacheDiagnostics> diagnostics(
+    Manifest? manifest,
+    String mediaRoot,
+  ) async {
+    if (manifest == null || mediaRoot.trim().isEmpty) {
+      return MediaCacheDiagnostics(
+        cachedMediaCount: 0,
+        cacheSizeBytes: 0,
+        downloadFailures: _downloadFailures,
+      );
+    }
+
+    var count = 0;
+    var sizeBytes = 0;
+    for (final media in manifest.media) {
+      try {
+        final target = await _targetFile(media, mediaRoot);
+        if (await _isValid(target, media, verifyHashWhenUncached: false)) {
+          count++;
+          sizeBytes += await target.length();
+        }
+      } catch (e) {
+        await AppLogger.log(
+          'Media cache diagnostics skipped id=${media.id}: $e',
+        );
+      }
+    }
+    return MediaCacheDiagnostics(
+      cachedMediaCount: count,
+      cacheSizeBytes: sizeBytes,
+      downloadFailures: _downloadFailures,
+    );
+  }
 
   Future<File?> ensureMediaFile(ManifestMedia media, String mediaRoot) {
     return _inflight.putIfAbsent(media.id, () async {
@@ -41,7 +91,7 @@ class MediaCacheService {
           return null;
         }
         final target = await _targetFile(media, mediaRoot);
-        if (await _isValid(target, media)) {
+        if (await _isValid(target, media, verifyHashWhenUncached: false)) {
           await AppLogger.log(
             'media cache hit: id=${media.id} name=${media.safeBaseName} elapsed=${DateTime.now().difference(startedAt).inMilliseconds}ms path=${target.path}',
           );
@@ -81,11 +131,13 @@ class MediaCacheService {
         await AppLogger.log(
           'media cache failed: id=${media.id} name=${media.safeBaseName} elapsed=${DateTime.now().difference(startedAt).inMilliseconds}ms',
         );
+        _downloadFailures++;
         return null;
       } catch (e) {
         await AppLogger.log(
           'Media cache error id=${media.id} elapsed=${DateTime.now().difference(startedAt).inMilliseconds}ms: $e',
         );
+        _downloadFailures++;
         return null;
       } finally {
         _inflight.remove(media.id);
@@ -102,17 +154,34 @@ class MediaCacheService {
     return File(p.join(dir.path, fileName));
   }
 
-  Future<bool> _isValid(File file, ManifestMedia media) async {
+  Future<bool> _isValid(
+    File file,
+    ManifestMedia media, {
+    bool verifyHashWhenUncached = true,
+  }) async {
     if (!await file.exists()) return false;
 
-    if (media.size > 0) {
-      final stat = await file.stat();
-      if (stat.size != media.size) return false;
+    final stat = await file.stat();
+    if (media.size > 0 && stat.size != media.size) return false;
+
+    final index = await _validationIndex(file.parent.path);
+    final cached = index[media.id];
+    if (cached != null && cached.matches(file, media, stat)) {
+      return true;
     }
 
-    if (media.sha256.isEmpty) return true;
+    if (media.sha256.isEmpty) {
+      await _rememberValid(file, media, stat);
+      return true;
+    }
+    if (!verifyHashWhenUncached) return true;
+
     final digest = await sha256.bind(file.openRead()).first;
-    return digest.toString().toLowerCase() == media.sha256.toLowerCase();
+    final valid = digest.toString().toLowerCase() == media.sha256.toLowerCase();
+    if (valid) {
+      await _rememberValid(file, media, stat);
+    }
+    return valid;
   }
 
   Future<void> _download(String url, File target) async {
@@ -158,7 +227,58 @@ class MediaCacheService {
     }
 
     await temp.rename(target.path);
+    await _rememberValid(target, media, await target.stat());
     return target;
+  }
+
+  Future<Map<int, _ValidatedCacheEntry>> _validationIndex(String mediaRoot) {
+    final root = Directory(mediaRoot).absolute.path;
+    return _validationIndexes.putIfAbsent(root, () async {
+      final file = File(p.join(root, '.media_cache_index.json'));
+      if (!await file.exists()) return <int, _ValidatedCacheEntry>{};
+      try {
+        final raw = jsonDecode(await file.readAsString());
+        if (raw is! Map) return <int, _ValidatedCacheEntry>{};
+        final entries = <int, _ValidatedCacheEntry>{};
+        for (final entry in raw.entries) {
+          final id = int.tryParse(entry.key.toString());
+          if (id == null || entry.value is! Map) continue;
+          final parsed = _ValidatedCacheEntry.fromJson(
+            (entry.value as Map).cast<String, dynamic>(),
+          );
+          if (parsed != null) entries[id] = parsed;
+        }
+        return entries;
+      } catch (e) {
+        await AppLogger.log('Media cache index ignored: $e');
+        return <int, _ValidatedCacheEntry>{};
+      }
+    });
+  }
+
+  Future<void> _rememberValid(
+    File file,
+    ManifestMedia media,
+    FileStat stat,
+  ) async {
+    final root = file.parent.absolute.path;
+    final index = await _validationIndex(root);
+    index[media.id] = _ValidatedCacheEntry(
+      path: file.absolute.path,
+      sha256: media.sha256.toLowerCase(),
+      size: stat.size,
+      modifiedMs: stat.modified.millisecondsSinceEpoch,
+    );
+    final payload = <String, dynamic>{
+      for (final entry in index.entries) '${entry.key}': entry.value.toJson(),
+    };
+    try {
+      await File(
+        p.join(root, '.media_cache_index.json'),
+      ).writeAsString(jsonEncode(payload));
+    } catch (e) {
+      await AppLogger.log('Media cache index write warning: $e');
+    }
   }
 
   Duration _backoffDelay(int attempt) {
@@ -171,5 +291,52 @@ class MediaCacheService {
     final jitter = 0.8 + (_rng.nextDouble() * 0.4);
     final ms = (base.inMilliseconds * jitter).round();
     return Duration(milliseconds: ms < 500 ? 500 : ms);
+  }
+}
+
+class _ValidatedCacheEntry {
+  const _ValidatedCacheEntry({
+    required this.path,
+    required this.sha256,
+    required this.size,
+    required this.modifiedMs,
+  });
+
+  final String path;
+  final String sha256;
+  final int size;
+  final int modifiedMs;
+
+  static _ValidatedCacheEntry? fromJson(Map<String, dynamic> json) {
+    final path = json['path'];
+    final sha256 = json['sha256'];
+    final size = json['size'];
+    final modifiedMs = json['modified_ms'];
+    if (path is! String ||
+        sha256 is! String ||
+        size is! int ||
+        modifiedMs is! int) {
+      return null;
+    }
+    return _ValidatedCacheEntry(
+      path: path,
+      sha256: sha256,
+      size: size,
+      modifiedMs: modifiedMs,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'path': path,
+    'sha256': sha256,
+    'size': size,
+    'modified_ms': modifiedMs,
+  };
+
+  bool matches(File file, ManifestMedia media, FileStat stat) {
+    return path == file.absolute.path &&
+        sha256 == media.sha256.toLowerCase() &&
+        size == stat.size &&
+        modifiedMs == stat.modified.millisecondsSinceEpoch;
   }
 }

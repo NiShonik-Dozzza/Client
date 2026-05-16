@@ -19,6 +19,8 @@ import '../services/media_cache_service.dart';
 enum DeviceSetupStage { booting, setupRequired, pendingApproval, ready }
 
 class PlaylistController extends GetxController {
+  static const String _clientVersion = 'panel-client 1.0.0+1';
+
   final RxBool _isLoading = false.obs;
   final RxInt version = 0.obs;
   final Rx<DeviceSetupStage> _setupStage = DeviceSetupStage.booting.obs;
@@ -47,6 +49,7 @@ class PlaylistController extends GetxController {
   Timer? _registrationPollTimer;
   int _manifestFailures = 0;
   bool _manifestInFlight = false;
+  Future<void> _prefetchChain = Future.value();
   final _rng = Random();
 
   static const Duration _manifestBaseInterval = Duration(seconds: 5);
@@ -219,7 +222,7 @@ class PlaylistController extends GetxController {
       final request = await api.requestRegistration(
         deviceId: auth.deviceId,
         name: _deviceDisplayName.value,
-        clientVersion: 'panel-client 1.0.0+1',
+        clientVersion: _clientVersion,
       );
       _auth = auth.copyWith(
         token: '',
@@ -532,9 +535,16 @@ class PlaylistController extends GetxController {
       _manifestFailures = 0;
       final currentManifest = _manifest;
       if (currentManifest != null &&
-          _manifestSignature(currentManifest) == _manifestSignature(manifest)) {
+          currentManifest.revision == manifest.revision) {
         await AppLogger.log(
           'manifest fetch unchanged: device_id=${auth.deviceId} revision=${manifest.revision} items=${manifest.items.length}',
+        );
+        return;
+      }
+      if (currentManifest != null &&
+          _manifestSignature(currentManifest) == _manifestSignature(manifest)) {
+        await AppLogger.log(
+          'manifest fetch unchanged signature: device_id=${auth.deviceId} revision=${manifest.revision} items=${manifest.items.length}',
         );
         return;
       }
@@ -603,12 +613,20 @@ class PlaylistController extends GetxController {
       }
     }
 
-    for (final id in ids) {
-      final media = manifest.mediaById(id);
-      if (media != null) {
-        unawaited(ensureMediaFile(media));
+    final mediaToPrefetch = ids
+        .map(manifest.mediaById)
+        .whereType<ManifestMedia>()
+        .toList(growable: false);
+    if (mediaToPrefetch.isEmpty) return;
+
+    _prefetchChain = _prefetchChain.then((_) async {
+      for (final media in mediaToPrefetch) {
+        if (isOfflineMode.value || !isReady) return;
+        await ensureMediaFile(media);
+        await Future<void>.delayed(const Duration(milliseconds: 120));
       }
-    }
+    });
+    unawaited(_prefetchChain);
   }
 
   Future<void> updateNowPlaying(String? nowPlaying) async {
@@ -651,10 +669,16 @@ class PlaylistController extends GetxController {
     if (api == null || auth == null || !auth.hasToken) return;
 
     try {
+      final cacheDiagnostics = await _cache.diagnostics(_manifest, _mediaRoot);
       await api.heartbeat(
         deviceId: auth.deviceId,
         currentRevision: currentRevision,
         nowPlaying: _nowPlaying,
+        clientVersion: _clientVersion,
+        networkState: _manifestFailures == 0 ? 'online' : 'degraded',
+        cachedMediaCount: cacheDiagnostics.cachedMediaCount,
+        cacheSizeBytes: cacheDiagnostics.cacheSizeBytes,
+        mediaDownloadFailures: cacheDiagnostics.downloadFailures,
         token: auth.token,
       );
     } on ApiException catch (e) {

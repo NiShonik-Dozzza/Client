@@ -2,6 +2,29 @@
 
 Полный список того, что нужно довести для боевого запуска и дальнейшей эксплуатации клиентского player-приложения.
 
+## Audit 2026-05-16
+
+Что видно по текущему коду после сверки с сервером:
+- клиент уже работает с актуальным device API: `/api/v1/device/register/request`, `/register/status`, `/manifest`, `/heartbeat`, `/media/{id}`;
+- media скачивается через backend с Bearer token, проверяется по size и sha256, частично скачанные файлы пишутся во временный `.download`;
+- при `401/403/404` на manifest/heartbeat/download клиент сбрасывает регистрацию и возвращает устройство в setup flow;
+- есть периодический manifest polling, heartbeat, prefetch по `prefetch_seconds`, локальный manifest cache и offline-mode;
+- клиент отправляет runtime heartbeat-поля `client_version`, `network_state`, `cached_media_count`, `cache_size_bytes`, `media_download_failures`;
+- локальный service/editor mode и debug overlay остаются главным production-risk: их нужно защищать до боевого запуска;
+- лог-файл и media cache пока не имеют retention/cleanup policy;
+- Android package id и release signing оставлены шаблонными.
+
+Ближайшие client-side дополнения, которые стоит сделать перед следующим циклом:
+- [x] Расширить heartbeat: отправлять `client_version`, `network_state`, `cached_media_count`.
+- [x] Добавить расширенный подсчет cache/media diagnostics: общий размер и количество failed downloads.
+- [ ] Добавить очистку старого cache: удалять media, которых нет в текущем manifest и которые старше заданного TTL.
+- [ ] Добавить log rotation для `Documents/panel/log.txt`.
+- [ ] Защитить service/editor/debug режим PIN-кодом или отдельным service-mode, отключаемым в production build.
+- [ ] Сделать status screen для сервисного инженера: server url, device id, revision, last manifest sync, last heartbeat, cache summary, app version.
+- [ ] Добавить тесты на manifest parsing, registration status transitions, media cache checksum validation и playlist sequencing.
+- [ ] Для Android заменить `applicationId`, настроить signing config и проверить kiosk/fullscreen поведение на целевом устройстве.
+- [ ] Для Windows/Linux подготовить автозапуск, watchdog и installer/package.
+
 ## P0. Обязательно до первого боевого запуска
 
 ### Безопасность устройства

@@ -22,18 +22,21 @@ enum _Mode { image, video, black }
 enum _PlaybackContext { slotMedia, playlistItem }
 
 const Duration _scheduleBridgeTolerance = Duration(seconds: 2);
-const Duration _playlistVideoDeadlineGrace = Duration(milliseconds: 250);
+const Duration _videoPrepareLead = Duration(milliseconds: 1200);
+const Duration _videoPrepareWarmupTimeout = Duration(milliseconds: 1400);
 
 class _PreparedVideo {
   const _PreparedVideo({
     required this.playerIndex,
     required this.source,
     required this.mediaId,
+    required this.sequence,
   });
 
   final int playerIndex;
   final String source;
   final int mediaId;
+  final int sequence;
 }
 
 class PlayerScreen extends StatefulWidget {
@@ -58,8 +61,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
   late final List<String?> _playerLastErrors;
   late final List<Duration> _lastObservedPositions;
   late final List<DateTime?> _playerLastProgressAt;
+  Future<void>? _videoPlayerConfiguration;
   int _activeVideoIndex = 0;
   _PreparedVideo? _preparedVideo;
+  int? _warmingVideoIndex;
+  Timer? _prepareVideoTimer;
+  int _prepareVideoSeq = 0;
   String? _activeVideoSource;
   int _playbackTraceSeq = 0;
   int _activePlaybackTraceId = 0;
@@ -76,12 +83,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Timer? _imageTimer;
   Timer? _debugTimer;
   Timer? _playbackTraceTimer;
-  Timer? _playlistVideoDeadlineTimer;
 
   bool _initialized = false;
   bool _isDisposed = false;
-  DateTime? _playlistVideoDeadlineAt;
-  Duration? _playlistVideoDeadlineRequested;
 
   ManifestItem? _currentSlot;
   ManifestMedia? _currentMedia;
@@ -100,10 +104,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // debug overlay
   bool _debug = false; // скрыт по умолчанию
 
-  VideoController get _activeVideoController =>
-      _videoControllers[_activeVideoIndex];
   int get _standbyVideoIndex => _activeVideoIndex == 0 ? 1 : 0;
-  Player get _standbyPlayer => _players[_standbyVideoIndex];
 
   String _formatTc(Duration? value) {
     if (value == null) return '--:--:--.---';
@@ -111,8 +112,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final hours = abs.inHours.toString().padLeft(2, '0');
     final minutes = (abs.inMinutes % 60).toString().padLeft(2, '0');
     final seconds = (abs.inSeconds % 60).toString().padLeft(2, '0');
-    final milliseconds =
-        (abs.inMilliseconds % 1000).toString().padLeft(3, '0');
+    final milliseconds = (abs.inMilliseconds % 1000).toString().padLeft(3, '0');
     final sign = value.isNegative ? '-' : '';
     return '$sign$hours:$minutes:$seconds.$milliseconds';
   }
@@ -160,6 +160,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _playerPositions[playerIndex] = Duration.zero;
     _playerDurations[playerIndex] = Duration.zero;
     _playerBuffers[playerIndex] = Duration.zero;
+    _playerWidths[playerIndex] = null;
+    _playerHeights[playerIndex] = null;
     _lastObservedPositions[playerIndex] = Duration.zero;
     _playerLastProgressAt[playerIndex] = DateTime.now();
   }
@@ -233,121 +235,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  void _clearPlaylistVideoDeadline() {
-    _playlistVideoDeadlineTimer?.cancel();
-    _playlistVideoDeadlineTimer = null;
-    _playlistVideoDeadlineAt = null;
-    _playlistVideoDeadlineRequested = null;
-  }
-
-  Duration? _remainingPlaylistVideoDeadline() {
-    final deadline = _playlistVideoDeadlineAt;
-    if (deadline == null) return null;
-    final remaining = deadline.difference(DateTime.now());
-    return remaining.isNegative ? Duration.zero : remaining;
-  }
-
-  void _schedulePlaylistVideoDeadline() {
-    final item = _currentPlaylistItem;
-    final slot = _currentSlot;
-    if (_context != _PlaybackContext.playlistItem || item == null || slot == null) {
-      _clearPlaylistVideoDeadline();
-      return;
-    }
-
-    var duration = Duration(seconds: item.durationSec);
-    final slotLeft = slot.endTime.difference(DateTime.now());
-    if (slotLeft.isNegative || slotLeft == Duration.zero) {
-      _clearPlaylistVideoDeadline();
-      unawaited(_applySchedule(force: true));
-      return;
-    }
-    if (slotLeft < duration) {
-      duration = slotLeft;
-    }
-
-    _playlistVideoDeadlineTimer?.cancel();
-    _playlistVideoDeadlineTimer = null;
-    _playlistVideoDeadlineAt = null;
-    _playlistVideoDeadlineRequested = duration;
-    _tryArmPlaylistVideoDeadline(trigger: 'schedule');
-  }
-
-  void _tryArmPlaylistVideoDeadline({required String trigger}) {
-    final requested = _playlistVideoDeadlineRequested;
-    final item = _currentPlaylistItem;
-    final slot = _currentSlot;
-    if (requested == null ||
-        _context != _PlaybackContext.playlistItem ||
-        item == null ||
-        slot == null) {
-      return;
-    }
-    if (_playlistVideoDeadlineAt != null) return;
-    if (!_playerPlaying[_activeVideoIndex] || _playerBuffering[_activeVideoIndex]) {
-      return;
-    }
-
-    var duration = requested;
-    final slotLeft = slot.endTime.difference(DateTime.now());
-    if (slotLeft.isNegative || slotLeft == Duration.zero) {
-      _clearPlaylistVideoDeadline();
-      unawaited(_applySchedule(force: true));
-      return;
-    }
-    if (slotLeft < duration) {
-      duration = slotLeft;
-    }
-
-    _playlistVideoDeadlineAt = DateTime.now().add(duration);
-    _playlistVideoDeadlineRequested = null;
-    unawaited(
-      AppLogger.log(
-        'playlist video deadline armed: trace=$_activePlaybackTraceId trigger=$trigger duration=${duration.inMilliseconds}ms slot_left=${slotLeft.inMilliseconds}ms item=${_playlistItemLabel(item)} slot=${_slotLabel(slot)} media_tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
-      ),
-    );
-    _playlistVideoDeadlineTimer = Timer(duration, () {
-      if (_isDisposed || _context != _PlaybackContext.playlistItem) return;
-      final remaining = _remainingPlaylistVideoDeadline() ?? Duration.zero;
-      unawaited(
-        AppLogger.log(
-          'playlist video deadline fired: trace=$_activePlaybackTraceId remaining=${remaining.inMilliseconds}ms item=${_playlistItemLabel(_currentPlaylistItem)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
-        ),
-      );
-      _clearPlaylistVideoDeadline();
-      _expectVideoCompleted = false;
-      unawaited(_onPlaylistItemCompleted(reason: 'video-deadline'));
-    });
-  }
-
-  Future<void> _restartPlaylistVideoWithinDeadline() async {
-    final source = _activeVideoSource;
-    if (source == null || _mode != _Mode.video) {
-      await _onPlaylistItemCompleted(reason: 'video-restart-no-source');
-      return;
-    }
-
-    final remaining = _remainingPlaylistVideoDeadline() ?? Duration.zero;
-    await AppLogger.log(
-      'playlist video restart: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} remaining=${remaining.inMilliseconds}ms tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
-    );
-
-    try {
-      final player = _players[_activeVideoIndex];
-      await player.seek(Duration.zero);
-      await player.play();
-      _expectVideoCompleted = true;
-      _playerLastProgressAt[_activeVideoIndex] = DateTime.now();
-      _playbackTraceStallLogged = false;
-    } catch (e) {
-      _expectVideoCompleted = false;
-      await AppLogger.log(
-        'playlist video restart failed: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} error=$e',
-      );
-      await _onPlaylistItemCompleted(reason: 'video-restart-failed');
-    }
-  }
-
   Widget _buildImageView() {
     final imageKey = ValueKey(_imagePath);
     if (_imageIsFile) {
@@ -384,15 +271,94 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
+  Player _createVideoPlayer() {
+    return Player(
+      configuration: const PlayerConfiguration(
+        title: 'Panel Client Player',
+        osc: false,
+      ),
+    );
+  }
+
+  String _preferredHwdec() {
+    if (kIsWeb) return 'no';
+    if (Platform.isAndroid) return 'auto-safe';
+    return 'auto';
+  }
+
+  VideoController _createVideoController(Player player) {
+    return VideoController(
+      player,
+      configuration: VideoControllerConfiguration(
+        hwdec: _preferredHwdec(),
+        enableHardwareAcceleration: true,
+        androidAttachSurfaceAfterVideoParameters: true,
+      ),
+    );
+  }
+
+  Future<void> _configureVideoPlayer(Player player) async {
+    if (kIsWeb) return;
+
+    final platform = player.platform;
+    if (platform == null) return;
+
+    final options = <String, String>{
+      'hwdec': _preferredHwdec(),
+      'vd-lavc-threads': '0',
+      'vd-lavc-dr': 'yes',
+      'hwdec-extra-frames': '64',
+      'cache': 'yes',
+      'demuxer-max-bytes': '268435456',
+      'demuxer-max-back-bytes': '67108864',
+      'demuxer-thread': 'yes',
+      'framedrop': 'decoder+vo',
+      'vd-lavc-fast': 'yes',
+      'vd-lavc-skiploopfilter': 'nonkey',
+      'scale': 'bilinear',
+      'dscale': 'bilinear',
+      'cscale': 'bilinear',
+      'correct-downscaling': 'no',
+      'deband': 'no',
+      'interpolation': 'no',
+    };
+
+    for (final entry in options.entries) {
+      try {
+        await (platform as dynamic).setProperty(entry.key, entry.value);
+      } catch (e) {
+        unawaited(
+          AppLogger.log(
+            'media_kit option skipped: ${entry.key}=${entry.value} error=$e',
+          ),
+        );
+      }
+    }
+
+    unawaited(
+      AppLogger.log(
+        'media_kit configured: hwdec=${_preferredHwdec()} vd-lavc-threads=0 cache=yes framedrop=decoder+vo',
+      ),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
 
-    _players = [Player(), Player()];
+    _players = [_createVideoPlayer(), _createVideoPlayer()];
     _videoControllers = _players
-        .map(VideoController.new)
+        .map(_createVideoController)
         .toList(growable: false);
-    _playerBuffering = List<bool>.filled(_players.length, false, growable: false);
+    _videoPlayerConfiguration = Future.wait(
+      _players.map(_configureVideoPlayer),
+    );
+    unawaited(_videoPlayerConfiguration!);
+    _playerBuffering = List<bool>.filled(
+      _players.length,
+      false,
+      growable: false,
+    );
     _playerPlaying = List<bool>.filled(_players.length, false, growable: false);
     _playerPositions = List<Duration>.filled(
       _players.length,
@@ -433,12 +399,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         if (i == _activeVideoIndex || value) {
           unawaited(
             AppLogger.log(
-              'media_kit[$i] playing=$value trace=$_activePlaybackTraceId source=${_sourceLabel(i == _activeVideoIndex ? _activeVideoSource : _preparedVideo?.source)} tc=${_tcLabel(_playerPositions[i], _playerDurations[i])}',
+              'media_kit[$i] playing=$value trace=$_activePlaybackTraceId source=${_sourceLabel(i == _activeVideoIndex ? _activeVideoSource : null)} tc=${_tcLabel(_playerPositions[i], _playerDurations[i])}',
             ),
           );
-        }
-        if (i == _activeVideoIndex && value) {
-          _tryArmPlaylistVideoDeadline(trigger: 'playing');
         }
       });
       _players[i].stream.position.listen((value) {
@@ -447,7 +410,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
           _playerLastProgressAt[i] = DateTime.now();
           if (i == _activeVideoIndex) {
             _playbackTraceStallLogged = false;
-            _tryArmPlaylistVideoDeadline(trigger: 'progress');
           }
         } else if (i == _activeVideoIndex &&
             value + const Duration(milliseconds: 450) < previous) {
@@ -477,25 +439,42 @@ class _PlayerScreenState extends State<PlayerScreen> {
         if (i == _activeVideoIndex || value) {
           unawaited(
             AppLogger.log(
-              'media_kit[$i] buffering=$value trace=$_activePlaybackTraceId source=${_sourceLabel(i == _activeVideoIndex ? _activeVideoSource : _preparedVideo?.source)} tc=${_tcLabel(_playerPositions[i], _playerDurations[i])} buffer=${_formatTc(_playerBuffers[i])}',
+              'media_kit[$i] buffering=$value trace=$_activePlaybackTraceId source=${_sourceLabel(i == _activeVideoIndex ? _activeVideoSource : null)} tc=${_tcLabel(_playerPositions[i], _playerDurations[i])} buffer=${_formatTc(_playerBuffers[i])}',
             ),
           );
         }
-        if (i == _activeVideoIndex && !value) {
-          _tryArmPlaylistVideoDeadline(trigger: 'buffering-false');
+      });
+      _players[i].stream.videoParams.listen((value) {
+        final size = value.dw != null && value.dh != null
+            ? '${value.dw}x${value.dh}'
+            : '${value.w ?? "-"}x${value.h ?? "-"}';
+        if (i == _activeVideoIndex && (value.w != null || value.dw != null)) {
+          unawaited(
+            AppLogger.log(
+              'media_kit[$i] video-params trace=$_activePlaybackTraceId source=${_sourceLabel(_activeVideoSource)} size=$size pix=${value.pixelformat ?? "-"} hw_pix=${value.hwPixelformat ?? "-"}',
+            ),
+          );
         }
       });
-      _players[i].stream.error.listen(
-        (e) {
-          _playerLastErrors[i] = e;
-          unawaited(AppLogger.log('media_kit[$i] error: $e'));
-        },
-      );
+      _players[i].stream.track.listen((value) {
+        final video = value.video;
+        if (i == _activeVideoIndex && video.id != 'auto') {
+          unawaited(
+            AppLogger.log(
+              'media_kit[$i] video-track trace=$_activePlaybackTraceId codec=${video.codec ?? "-"} decoder=${video.decoder ?? "-"} size=${video.w ?? "-"}x${video.h ?? "-"} fps=${video.fps ?? "-"}',
+            ),
+          );
+        }
+      });
+      _players[i].stream.error.listen((e) {
+        _playerLastErrors[i] = e;
+        unawaited(AppLogger.log('media_kit[$i] error: $e'));
+      });
 
       _players[i].stream.completed.listen((completed) {
         unawaited(
           AppLogger.log(
-            'media_kit[$i] completed=$completed trace=$_activePlaybackTraceId source=${_sourceLabel(i == _activeVideoIndex ? _activeVideoSource : _preparedVideo?.source)} tc=${_tcLabel(_playerPositions[i], _playerDurations[i])}',
+            'media_kit[$i] completed=$completed trace=$_activePlaybackTraceId source=${_sourceLabel(i == _activeVideoIndex ? _activeVideoSource : null)} tc=${_tcLabel(_playerPositions[i], _playerDurations[i])}',
           ),
         );
         if (_isDisposed) return;
@@ -549,7 +528,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _tick?.cancel();
     _slotTimer?.cancel();
     _imageTimer?.cancel();
-    _clearPlaylistVideoDeadline();
     _expectVideoCompleted = false;
 
     await _stopEverything();
@@ -671,7 +649,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _currentPlaylist = controller.playlistById(nextSlot.contentId);
       } else if (nextSlot.contentType == ManifestContentType.media &&
           _currentMedia?.id == nextSlot.contentId) {
-        _currentMedia = controller.mediaById(nextSlot.contentId) ?? _currentMedia;
+        _currentMedia =
+            controller.mediaById(nextSlot.contentId) ?? _currentMedia;
       }
 
       _slotTimer?.cancel();
@@ -859,7 +838,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final src = diskPath ?? 'asset:///assets/media/${item.filename}';
 
       try {
-        setState(() => _mode = _Mode.video);
         await _playVideoSource(src, loopSingle: item.loop);
 
         await AppLogger.log(
@@ -896,14 +874,38 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
   // ===== КОНЕЦ НОВОГО МЕТОДА =====
 
-  Future<void> _clearPreparedVideo() async {
+  void _cancelPreparedVideo({bool stopPlayer = true}) {
+    _prepareVideoTimer?.cancel();
+    _prepareVideoTimer = null;
+    _prepareVideoSeq++;
+    final prepared = _preparedVideo;
     _preparedVideo = null;
+    _warmingVideoIndex = null;
+    if (mounted) setState(() {});
+    if (stopPlayer && prepared != null) {
+      unawaited(_stopPlayer(prepared.playerIndex));
+    }
+  }
+
+  Future<void> _stopPlayer(int playerIndex) async {
     try {
-      await _standbyPlayer.pause();
-      await _standbyPlayer.setPlaylistMode(PlaylistMode.none);
-      await _standbyPlayer.setVolume(0);
-      await _standbyPlayer.stop();
+      final player = _players[playerIndex];
+      await player.pause();
+      await player.setPlaylistMode(PlaylistMode.none);
+      await player.setVolume(0);
+      await player.stop();
     } catch (_) {}
+  }
+
+  Future<void> _waitForVideoWarmup(int playerIndex) async {
+    final hasSize = Stream<void>.periodic(const Duration(milliseconds: 50))
+        .firstWhere(
+          (_) =>
+              (_playerWidths[playerIndex] ?? 0) > 0 ||
+              (_playerHeights[playerIndex] ?? 0) > 0,
+        );
+    await hasSize.timeout(_videoPrepareWarmupTimeout, onTimeout: () {});
+    await Future<void>.delayed(const Duration(milliseconds: 120));
   }
 
   Future<void> _openVideoOnPlayer(
@@ -911,11 +913,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     String source, {
     required bool play,
     required PlaylistMode playlistMode,
+    double volume = 100,
   }) async {
+    await _videoPlayerConfiguration;
     final player = _players[playerIndex];
     _resetPlayerTraceState(playerIndex);
     await player.setPlaylistMode(playlistMode);
-    await player.setVolume(play ? 100 : 0);
+    await player.setVolume(play ? volume : 0);
     await player.open(Playlist([Media(source)]), play: play);
     if (!play) {
       await player.seek(Duration.zero);
@@ -923,46 +927,85 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  Future<bool> _activatePreparedVideoIfMatches(
-    String source, {
-    required bool loopSingle,
-  }) async {
-    final prepared = _preparedVideo;
-    if (prepared == null || prepared.source != source) {
-      return false;
+  Future<void> _prepareVideoOnStandby(
+    String source,
+    int mediaId,
+    int sequence,
+  ) async {
+    final existing = _preparedVideo;
+    if (existing != null &&
+        existing.source == source &&
+        existing.sequence == sequence) {
+      return;
     }
 
-    final previousActive = _activeVideoIndex;
-    _activeVideoIndex = prepared.playerIndex;
-    _preparedVideo = null;
-    _activeVideoSource = source;
-    _resetPlayerTraceState(_activeVideoIndex);
-
+    final playerIndex = _standbyVideoIndex;
+    _warmingVideoIndex = playerIndex;
+    if (mounted) setState(() {});
     await AppLogger.log(
-      'video activate prepared: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prev_player=$previousActive loop_single=$loopSingle prepared_media=${prepared.mediaId}',
+      'video prepare start: source=${_sourceLabel(source)} media_id=$mediaId standby_player=$playerIndex seq=$sequence',
     );
-
-    await _players[_activeVideoIndex].setPlaylistMode(
-      loopSingle ? PlaylistMode.single : PlaylistMode.none,
+    await _stopPlayer(playerIndex);
+    await _openVideoOnPlayer(
+      playerIndex,
+      source,
+      play: true,
+      playlistMode: PlaylistMode.none,
+      volume: 0,
     );
-    await _players[_activeVideoIndex].setVolume(100);
-    await _players[_activeVideoIndex].play();
-
+    await _waitForVideoWarmup(playerIndex);
+    if (_isDisposed || sequence != _prepareVideoSeq) {
+      _warmingVideoIndex = null;
+      await _stopPlayer(playerIndex);
+      return;
+    }
     try {
-      await _players[previousActive].pause();
-      await _players[previousActive].setVolume(0);
-      await _players[previousActive].stop();
+      await _players[playerIndex].pause();
+      await _players[playerIndex].seek(Duration.zero);
     } catch (_) {}
-
-    _expectVideoCompleted = !loopSingle;
-    _startPlaybackTraceTimer();
-    await AppLogger.log(
-      'video active: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prepared=true loop_single=$loopSingle size=${_playerSizeLabel(_activeVideoIndex)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+    _preparedVideo = _PreparedVideo(
+      playerIndex: playerIndex,
+      source: source,
+      mediaId: mediaId,
+      sequence: sequence,
     );
-    if (mounted) {
-      setState(() => _mode = _Mode.video);
+    _warmingVideoIndex = null;
+    await AppLogger.log(
+      'video prepare ready: source=${_sourceLabel(source)} media_id=$mediaId standby_player=$playerIndex seq=$sequence size=${_playerSizeLabel(playerIndex)}',
+    );
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _scheduleVideoPreparation(String source, int mediaId) async {
+    _cancelPreparedVideo();
+    final sequence = _prepareVideoSeq;
+    if (_mode != _Mode.video) {
+      await AppLogger.log(
+        'video prepare immediate: source=${_sourceLabel(source)} media_id=$mediaId mode=${_mode.name} standby_player=$_standbyVideoIndex seq=$sequence',
+      );
+      await _prepareVideoOnStandby(source, mediaId, sequence);
+      return;
     }
-    return true;
+
+    final duration = _playerDurations[_activeVideoIndex];
+    final position = _playerPositions[_activeVideoIndex];
+    final remaining = duration > position ? duration - position : Duration.zero;
+    final delay = duration <= Duration.zero || remaining <= _videoPrepareLead
+        ? Duration.zero
+        : remaining - _videoPrepareLead;
+
+    await AppLogger.log(
+      'video prepare scheduled: source=${_sourceLabel(source)} media_id=$mediaId delay=${delay.inMilliseconds}ms remaining=${remaining.inMilliseconds}ms active_player=$_activeVideoIndex standby_player=$_standbyVideoIndex seq=$sequence',
+    );
+
+    if (delay == Duration.zero) {
+      await _prepareVideoOnStandby(source, mediaId, sequence);
+      return;
+    }
+
+    _prepareVideoTimer = Timer(delay, () {
+      unawaited(_prepareVideoOnStandby(source, mediaId, sequence));
+    });
   }
 
   Future<void> _playVideoSource(
@@ -970,81 +1013,97 @@ class _PlayerScreenState extends State<PlayerScreen> {
     required bool loopSingle,
   }) async {
     await AppLogger.log(
-      'video source request: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} loop_single=$loopSingle active_player=$_activeVideoIndex standby_player=$_standbyVideoIndex prepared_match=${_preparedVideo?.source == source}',
+      'video source request: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} loop_single=$loopSingle active_player=$_activeVideoIndex',
     );
-    final activated = await _activatePreparedVideoIfMatches(
-      source,
-      loopSingle: loopSingle,
-    );
-    if (activated) {
+
+    final prepared = _preparedVideo;
+    if (prepared != null && prepared.source == source) {
+      final previousActive = _activeVideoIndex;
+      _preparedVideo = null;
+      _warmingVideoIndex = null;
+      _prepareVideoTimer?.cancel();
+      _prepareVideoTimer = null;
+      _activeVideoIndex = prepared.playerIndex;
+      _activeVideoSource = source;
+      await _players[_activeVideoIndex].setPlaylistMode(
+        loopSingle ? PlaylistMode.single : PlaylistMode.none,
+      );
+      await _players[_activeVideoIndex].setVolume(100);
+      await _players[_activeVideoIndex].play();
+      _expectVideoCompleted = !loopSingle;
+      _startPlaybackTraceTimer();
+      await AppLogger.log(
+        'video activate prepared: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prev_player=$previousActive loop_single=$loopSingle media_id=${prepared.mediaId}',
+      );
+      if (mounted) setState(() => _mode = _Mode.video);
+      unawaited(_stopPlayer(previousActive));
       return;
     }
 
-    await _clearPreparedVideo();
+    _cancelPreparedVideo();
+
+    if (_mode == _Mode.video && _activeVideoSource != null) {
+      final previousActive = _activeVideoIndex;
+      final nextPlayer = _standbyVideoIndex;
+      _warmingVideoIndex = nextPlayer;
+      if (mounted) setState(() {});
+      await AppLogger.log(
+        'video transition warmup: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} standby_player=$nextPlayer prev_player=$previousActive loop_single=$loopSingle',
+      );
+      await _stopPlayer(nextPlayer);
+      await _openVideoOnPlayer(
+        nextPlayer,
+        source,
+        play: true,
+        playlistMode: loopSingle ? PlaylistMode.single : PlaylistMode.none,
+        volume: 0,
+      );
+      await _waitForVideoWarmup(nextPlayer);
+      if (_isDisposed) return;
+      await _players[nextPlayer].setVolume(100);
+      _activeVideoIndex = nextPlayer;
+      _activeVideoSource = source;
+      _warmingVideoIndex = null;
+      _expectVideoCompleted = !loopSingle;
+      _startPlaybackTraceTimer();
+      await AppLogger.log(
+        'video transition active: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prev_player=$previousActive loop_single=$loopSingle size=${_playerSizeLabel(_activeVideoIndex)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+      );
+      if (mounted) setState(() => _mode = _Mode.video);
+      unawaited(_stopPlayer(previousActive));
+      return;
+    }
+
     await _openVideoOnPlayer(
       _activeVideoIndex,
       source,
       play: true,
       playlistMode: loopSingle ? PlaylistMode.single : PlaylistMode.none,
     );
+    await _waitForVideoWarmup(_activeVideoIndex);
+    if (_isDisposed) return;
     _activeVideoSource = source;
     _expectVideoCompleted = !loopSingle;
     _startPlaybackTraceTimer();
     await AppLogger.log(
-      'video active: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prepared=false loop_single=$loopSingle size=${_playerSizeLabel(_activeVideoIndex)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+      'video active: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex loop_single=$loopSingle size=${_playerSizeLabel(_activeVideoIndex)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
     );
-  }
-
-  Future<void> _prepareVideoOnStandby(String source, int mediaId) async {
-    final prepared = _preparedVideo;
-    if (prepared != null && prepared.source == source) {
-      await AppLogger.log(
-        'video prepare skip: source=${_sourceLabel(source)} media_id=$mediaId standby_player=${prepared.playerIndex}',
-      );
-      return;
-    }
-
-    await AppLogger.log(
-      'video prepare start: source=${_sourceLabel(source)} media_id=$mediaId standby_player=$_standbyVideoIndex',
-    );
-    await _clearPreparedVideo();
-    await _openVideoOnPlayer(
-      _standbyVideoIndex,
-      source,
-      play: false,
-      playlistMode: PlaylistMode.none,
-    );
-    _preparedVideo = _PreparedVideo(
-      playerIndex: _standbyVideoIndex,
-      source: source,
-      mediaId: mediaId,
-    );
-    await AppLogger.log(
-      'video prepare ready: source=${_sourceLabel(source)} media_id=$mediaId standby_player=$_standbyVideoIndex',
-    );
+    if (mounted) setState(() => _mode = _Mode.video);
   }
 
   Future<void> _stopEverything() async {
     _imageTimer?.cancel();
-    _clearPlaylistVideoDeadline();
+    _cancelPreparedVideo();
     _expectVideoCompleted = false;
-    if (_mode == _Mode.video ||
-        _activeVideoSource != null ||
-        _preparedVideo != null) {
+    if (_mode == _Mode.video || _activeVideoSource != null) {
       await AppLogger.log(
-        'stop playback: trace=$_activePlaybackTraceId active_source=${_sourceLabel(_activeVideoSource)} prepared_source=${_sourceLabel(_preparedVideo?.source)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+        'stop playback: trace=$_activePlaybackTraceId active_source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
       );
     }
     _stopPlaybackTraceTimer();
     _activeVideoSource = null;
-    _preparedVideo = null;
-    for (final player in _players) {
-      try {
-        await player.pause();
-        await player.setPlaylistMode(PlaylistMode.none);
-        await player.setVolume(0);
-        await player.stop();
-      } catch (_) {}
+    for (var i = 0; i < _players.length; i++) {
+      await _stopPlayer(i);
     }
   }
 
@@ -1096,6 +1155,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     if (media.isVideo) {
+      _imageTimer?.cancel();
       _activePlaybackTraceId = ++_playbackTraceSeq;
       _lastPlaybackTraceSecond = -1;
       _playbackTraceStallLogged = false;
@@ -1103,7 +1163,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
         'playback trace start: trace=$_activePlaybackTraceId context=${context.name} slot=${_slotLabel(slotContext)} item=${_playlistItemLabel(_currentPlaylistItem)} media=${_mediaLabel(media)} file=${_sourceLabel(file.path)}',
       );
       try {
-        setState(() => _mode = _Mode.video);
         await _playVideoSource(
           file.path,
           loopSingle:
@@ -1113,14 +1172,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         await AppLogger.log(
           'PLAY VIDEO: ${media.safeBaseName} trace=$_activePlaybackTraceId src=${file.path} slot=${_slotLabel(slotContext)} item=${_playlistItemLabel(_currentPlaylistItem)}',
         );
-        if (context == _PlaybackContext.playlistItem) {
-          _schedulePlaylistVideoDeadline();
-        } else {
-          _clearPlaylistVideoDeadline();
-        }
       } catch (e) {
         _expectVideoCompleted = false;
-        _clearPlaylistVideoDeadline();
         await AppLogger.log(
           'VIDEO OPEN FAILED: ${media.safeBaseName} trace=$_activePlaybackTraceId error=$e',
         );
@@ -1194,17 +1247,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    // Онлайн-режим (старый код)
     if (_context == _PlaybackContext.playlistItem) {
-      final remaining = _remainingPlaylistVideoDeadline();
-      if (remaining != null && remaining > _playlistVideoDeadlineGrace) {
-        await AppLogger.log(
-          'playlist video completed early: trace=$_activePlaybackTraceId remaining=${remaining.inMilliseconds}ms item=${_playlistItemLabel(_currentPlaylistItem)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
-        );
-        await _restartPlaylistVideoWithinDeadline();
-        return;
-      }
-      _clearPlaylistVideoDeadline();
       await _onPlaylistItemCompleted(reason: 'player-completed');
       return;
     }
@@ -1260,7 +1303,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _onPlaylistItemCompleted({String reason = 'unknown'}) async {
     final controller = Get.find<PlaylistController>();
-    _clearPlaylistVideoDeadline();
     await AppLogger.log(
       'playlist item completed: trace=$_activePlaybackTraceId reason=$reason index=$_playlistIndex item=${_playlistItemLabel(_currentPlaylistItem)} media=${_mediaLabel(_currentMedia)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
     );
@@ -1328,9 +1370,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (nextIndex >= playlist.items.length) {
       if (slot.loopMode != ManifestLoopMode.fill) {
         await AppLogger.log(
-          'prepare upcoming clear: reached playlist end without loop playlist=${playlist.id}:${playlist.name}',
+          'prepare upcoming skip: reached playlist end without loop playlist=${playlist.id}:${playlist.name}',
         );
-        await _clearPreparedVideo();
+        _cancelPreparedVideo();
         return;
       }
       nextIndex = 0;
@@ -1342,15 +1384,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await AppLogger.log(
         'prepare upcoming missing media: item=${_playlistItemLabel(item)} playlist=${playlist.id}:${playlist.name}',
       );
-      await _clearPreparedVideo();
+      _cancelPreparedVideo();
       return;
     }
 
     if (media.isImage) {
+      _cancelPreparedVideo();
       await AppLogger.log(
         'prepare upcoming image: item=${_playlistItemLabel(item)} media=${_mediaLabel(media)}',
       );
-      await _clearPreparedVideo();
       final file = await controller.ensureMediaFile(media);
       if (file == null || !mounted) return;
       await precacheImage(FileImage(file), context);
@@ -1366,17 +1408,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
         await AppLogger.log(
           'prepare upcoming video missing file: item=${_playlistItemLabel(item)} media=${_mediaLabel(media)}',
         );
-        await _clearPreparedVideo();
         return;
       }
       await AppLogger.log(
-        'prepare upcoming video: item=${_playlistItemLabel(item)} media=${_mediaLabel(media)} file=${_sourceLabel(file.path)}',
+        'prepare upcoming video file ready: item=${_playlistItemLabel(item)} media=${_mediaLabel(media)} file=${_sourceLabel(file.path)}',
       );
-      await _prepareVideoOnStandby(file.path, media.id);
+      await _scheduleVideoPreparation(file.path, media.id);
       return;
     }
 
-    await _clearPreparedVideo();
+    _cancelPreparedVideo();
   }
 
   @override
@@ -1389,33 +1430,34 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     final slot = _currentSlot;
+    final warmupVideoIndex = _preparedVideo?.playerIndex ?? _warmingVideoIndex;
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          AnimatedSwitcher(
-            duration: const Duration(milliseconds: 200),
-            layoutBuilder: (currentChild, previousChildren) => Stack(
-              fit: StackFit.expand,
-              children: [
-                ...previousChildren,
-                if (currentChild != null) currentChild,
-              ],
-            ),
-            child: _mode == _Mode.image && _imagePath.isNotEmpty
-                ? _buildImageView()
-                : _mode == _Mode.video
-                ? SizedBox.expand(
+          if (_mode == _Mode.image && _imagePath.isNotEmpty)
+            _buildImageView()
+          else if (_mode != _Mode.video && warmupVideoIndex == null)
+            const SizedBox.shrink(),
+
+          for (var i = 0; i < _videoControllers.length; i++)
+            if ((_mode == _Mode.video && i == _activeVideoIndex) ||
+                i == warmupVideoIndex)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: Opacity(
+                    opacity: _mode == _Mode.video && i == _activeVideoIndex
+                        ? 1
+                        : 0.001,
                     child: Video(
-                      key: ValueKey('video-$_activeVideoIndex'),
-                      controller: _activeVideoController,
+                      controller: _videoControllers[i],
                       fit: BoxFit.contain,
                     ),
-                  )
-                : const SizedBox.shrink(),
-          ),
+                  ),
+                ),
+              ),
 
           // ===== ДОБАВЛЕНО: кнопка редактора при наведении мыши =====
           // Новый исправленный код:
@@ -1501,6 +1543,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _imageTimer?.cancel();
     _debugTimer?.cancel();
     _playbackTraceTimer?.cancel();
+    _prepareVideoTimer?.cancel();
     HardwareKeyboard.instance.removeHandler(_onKey);
     for (final player in _players) {
       player.dispose();

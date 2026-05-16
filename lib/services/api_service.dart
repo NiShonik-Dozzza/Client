@@ -158,6 +158,11 @@ class ApiService {
     required String deviceId,
     required String currentRevision,
     required String? nowPlaying,
+    required String clientVersion,
+    required String networkState,
+    required int cachedMediaCount,
+    required int cacheSizeBytes,
+    required int mediaDownloadFailures,
     String? token,
   }) async {
     final resp = await _client.post(
@@ -167,6 +172,11 @@ class ApiService {
         'device_id': deviceId,
         'current_revision_str': currentRevision,
         'now_playing': nowPlaying ?? '',
+        'client_version': clientVersion,
+        'network_state': networkState,
+        'cached_media_count': cachedMediaCount,
+        'cache_size_bytes': cacheSizeBytes,
+        'media_download_failures': mediaDownloadFailures,
       }),
     );
     _decodeMap(resp);
