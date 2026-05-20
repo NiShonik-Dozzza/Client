@@ -6,8 +6,15 @@ import 'app_logger.dart';
 class AppConfig {
   final String mediaRoot;
   final String serverUrl;
+  final String selectedDisplayId;
+  final int displayRotation;
 
-  AppConfig({required this.mediaRoot, required this.serverUrl});
+  AppConfig({
+    required this.mediaRoot,
+    required this.serverUrl,
+    required this.selectedDisplayId,
+    required this.displayRotation,
+  });
 
   String get apiBase {
     if (serverUrl.isEmpty) return '';
@@ -17,11 +24,18 @@ class AppConfig {
   Map<String, dynamic> toJson() => {
     'media_root': mediaRoot,
     'server_url': serverUrl,
+    if (selectedDisplayId.isNotEmpty) 'selected_display_id': selectedDisplayId,
+    'display_rotation': displayRotation,
     if (serverUrl.isNotEmpty) 'api_base': apiBase,
   };
 
   static AppConfig defaults(String docsMediaDir) {
-    return AppConfig(mediaRoot: docsMediaDir, serverUrl: '');
+    return AppConfig(
+      mediaRoot: docsMediaDir,
+      serverUrl: '',
+      selectedDisplayId: '',
+      displayRotation: 0,
+    );
   }
 }
 
@@ -48,11 +62,18 @@ class ConfigService {
         (map['server_url'] as String?)?.trim(),
         (map['api_base'] as String?)?.trim(),
       );
+      final selectedDisplayId =
+          (map['selected_display_id'] as String?)?.trim() ?? '';
+      final displayRotation = _normalizeRotation(
+        _asInt(map['display_rotation']),
+      );
       final cfg = AppConfig(
         mediaRoot: (mediaRoot == null || mediaRoot.isEmpty)
             ? defaultConfig.mediaRoot
             : mediaRoot,
         serverUrl: serverUrl,
+        selectedDisplayId: selectedDisplayId,
+        displayRotation: displayRotation,
       );
       _cached = cfg;
       await AppLogger.log(
@@ -71,6 +92,12 @@ class ConfigService {
     final cfg = AppConfig(
       mediaRoot: newRoot,
       serverUrl: _cached?.serverUrl ?? AppConfig.defaults(newRoot).serverUrl,
+      selectedDisplayId:
+          _cached?.selectedDisplayId ??
+          AppConfig.defaults(newRoot).selectedDisplayId,
+      displayRotation:
+          _cached?.displayRotation ??
+          AppConfig.defaults(newRoot).displayRotation,
     );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
@@ -83,6 +110,8 @@ class ConfigService {
     final cfg = AppConfig(
       mediaRoot: _cached?.mediaRoot ?? (await AppPaths.mediaDir()).path,
       serverUrl: normalized,
+      selectedDisplayId: _cached?.selectedDisplayId ?? '',
+      displayRotation: _cached?.displayRotation ?? 0,
     );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
@@ -91,6 +120,28 @@ class ConfigService {
 
   Future<void> setApiBase(String newBase) async {
     await setServerUrl(_extractServerUrl('', newBase));
+  }
+
+  Future<void> setDisplayPreferences({
+    String? selectedDisplayId,
+    int? displayRotation,
+  }) async {
+    final file = await AppPaths.configFile();
+    final current = _cached ?? await load();
+    final cfg = AppConfig(
+      mediaRoot: current.mediaRoot,
+      serverUrl: current.serverUrl,
+      selectedDisplayId: (selectedDisplayId ?? current.selectedDisplayId)
+          .trim(),
+      displayRotation: _normalizeRotation(
+        displayRotation ?? current.displayRotation,
+      ),
+    );
+    await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
+    _cached = cfg;
+    await AppLogger.log(
+      'Config updated: selected_display_id=${cfg.selectedDisplayId} display_rotation=${cfg.displayRotation}',
+    );
   }
 
   static String joinMedia(String mediaRoot, String filename) {
@@ -127,4 +178,20 @@ String _normalizeServerUrl(String value) {
       .replace(path: '', query: null, fragment: null)
       .toString()
       .replaceFirst(RegExp(r'/$'), '');
+}
+
+int _asInt(dynamic value, [int fallback = 0]) {
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value.trim()) ?? fallback;
+  return fallback;
+}
+
+int _normalizeRotation(int value) {
+  const allowed = <int>{0, 90, 180, 270};
+  final normalized = value % 360;
+  if (allowed.contains(normalized)) {
+    return normalized;
+  }
+  return 0;
 }

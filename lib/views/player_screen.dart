@@ -22,8 +22,10 @@ enum _Mode { image, video, black }
 enum _PlaybackContext { slotMedia, playlistItem }
 
 const Duration _scheduleBridgeTolerance = Duration(seconds: 2);
-const Duration _videoPrepareLead = Duration(milliseconds: 1200);
-const Duration _videoPrepareWarmupTimeout = Duration(milliseconds: 1400);
+const Duration _videoPrepareLead = Duration(milliseconds: 450);
+const Duration _videoPrepareWarmupTimeout = Duration(milliseconds: 2200);
+const Duration _videoPrepareFrameThreshold = Duration(milliseconds: 48);
+const Duration _videoRetireDelay = Duration(milliseconds: 180);
 
 class _PreparedVideo {
   const _PreparedVideo({
@@ -72,6 +74,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   int _activePlaybackTraceId = 0;
   int _lastPlaybackTraceSecond = -1;
   bool _playbackTraceStallLogged = false;
+  double _lastAppliedVideoVolume = -1;
+  String _lastAppliedContentRevision = '';
+  Worker? _controllerVersionWorker;
 
   // ===== ДОБАВЛЕНО: поддержка редактора =====
   bool _isEditorOpen = false; // Отслеживает открыт ли редактор
@@ -155,6 +160,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return '${width}x$height';
   }
 
+  double get _effectiveVideoVolume {
+    final controller = Get.find<PlaylistController>();
+    if (controller.audioMuted) {
+      return 0;
+    }
+    return controller.masterVolume.toDouble();
+  }
+
+  Future<void> _syncActiveVideoVolume() async {
+    if (_mode != _Mode.video) {
+      _lastAppliedVideoVolume = -1;
+      return;
+    }
+    final targetVolume = _effectiveVideoVolume;
+    if (_lastAppliedVideoVolume == targetVolume) {
+      return;
+    }
+    try {
+      await _players[_activeVideoIndex].setVolume(targetVolume);
+      _lastAppliedVideoVolume = targetVolume;
+    } catch (_) {}
+  }
+
   void _resetPlayerTraceState(int playerIndex) {
     _playerLastErrors[playerIndex] = null;
     _playerPositions[playerIndex] = Duration.zero;
@@ -164,6 +192,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _playerHeights[playerIndex] = null;
     _lastObservedPositions[playerIndex] = Duration.zero;
     _playerLastProgressAt[playerIndex] = DateTime.now();
+  }
+
+  bool _playerHasRenderableFrame(int playerIndex) {
+    final hasSize =
+        (_playerWidths[playerIndex] ?? 0) > 0 ||
+        (_playerHeights[playerIndex] ?? 0) > 0;
+    if (!hasSize) return false;
+
+    return _playerPositions[playerIndex] >= _videoPrepareFrameThreshold ||
+        _playerBuffers[playerIndex] > Duration.zero ||
+        (_playerPlaying[playerIndex] && !_playerBuffering[playerIndex]);
   }
 
   void _startPlaybackTraceTimer() {
@@ -557,9 +596,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _boot() async {
     try {
       final controller = Get.find<PlaylistController>();
+      await controller.applyEffectiveDisplaySelection(force: true);
 
       // реагируем на обновление манифеста
-      ever<int>(controller.version, (_) {
+      _controllerVersionWorker = ever<int>(controller.version, (_) {
         unawaited(
           AppLogger.log(
             'schedule apply requested: revision=${controller.currentRevision} items=${controller.items.length} mode=${controller.isOfflineMode.value ? "offline" : "online"}',
@@ -590,6 +630,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (_isDisposed || _isEditorOpen) return;
 
     final controller = Get.find<PlaylistController>();
+    await controller.applyEffectiveDisplaySelection();
     final now = DateTime.now();
 
     // ===== ИСПРАВЛЕНО: учитываем оффлайн-режим =====
@@ -641,32 +682,47 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (exactSame) return;
 
     final sameLogical = _isSameLogicalSlotAt(_currentSlot, nextSlot, now);
+    final currentContentRevision = controller.manifest?.contentRevision ?? '';
+    final contentChangedWithinSlot =
+        force &&
+        currentContentRevision.isNotEmpty &&
+        currentContentRevision != _lastAppliedContentRevision;
     if (sameLogical) {
-      final previousSlot = _currentSlot;
-      _currentSlot = nextSlot;
-      if (nextSlot.contentType == ManifestContentType.playlist &&
-          _currentPlaylist?.id == nextSlot.contentId) {
-        _currentPlaylist = controller.playlistById(nextSlot.contentId);
-      } else if (nextSlot.contentType == ManifestContentType.media &&
-          _currentMedia?.id == nextSlot.contentId) {
-        _currentMedia =
-            controller.mediaById(nextSlot.contentId) ?? _currentMedia;
-      }
+      if (contentChangedWithinSlot) {
+        await AppLogger.log(
+          'schedule content revision changed within active slot: old=$_lastAppliedContentRevision new=$currentContentRevision slot=${_slotLabel(nextSlot)}',
+        );
+      } else {
+        final previousSlot = _currentSlot;
+        _currentSlot = nextSlot;
+        if (nextSlot.contentType == ManifestContentType.playlist &&
+            _currentPlaylist?.id == nextSlot.contentId) {
+          _currentPlaylist = controller.playlistById(nextSlot.contentId);
+        } else if (nextSlot.contentType == ManifestContentType.media &&
+            _currentMedia?.id == nextSlot.contentId) {
+          _currentMedia =
+              controller.mediaById(nextSlot.contentId) ?? _currentMedia;
+        }
 
-      _slotTimer?.cancel();
-      final updatedDuration = nextSlot.endTime.difference(now);
-      if (!updatedDuration.isNegative) {
-        _slotTimer = Timer(updatedDuration, () => _applySchedule(force: true));
-      }
+        _slotTimer?.cancel();
+        final updatedDuration = nextSlot.endTime.difference(now);
+        if (!updatedDuration.isNegative) {
+          _slotTimer = Timer(
+            updatedDuration,
+            () => _applySchedule(force: true),
+          );
+        }
 
-      await AppLogger.log(
-        'schedule keep active slot: force=$force from=${_slotLabel(previousSlot)} to=${_slotLabel(nextSlot)} media=${_mediaLabel(_currentMedia)} item=${_playlistItemLabel(_currentPlaylistItem)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
-      );
+        await AppLogger.log(
+          'schedule keep active slot: force=$force from=${_slotLabel(previousSlot)} to=${_slotLabel(nextSlot)} media=${_mediaLabel(_currentMedia)} item=${_playlistItemLabel(_currentPlaylistItem)} source=${_sourceLabel(_activeVideoSource)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
+        );
 
-      if (mounted) {
-        setState(() {});
+        if (mounted) {
+          setState(() {});
+        }
+        await _syncActiveVideoVolume();
+        return;
       }
-      return;
     }
 
     await AppLogger.log(
@@ -686,6 +742,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     await controller.updateNowPlaying(_nowPlayingFor(nextSlot));
+    _lastAppliedContentRevision = currentContentRevision;
 
     if (nextSlot.contentType == ManifestContentType.media) {
       final media = controller.mediaById(nextSlot.contentId);
@@ -898,14 +955,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _waitForVideoWarmup(int playerIndex) async {
-    final hasSize = Stream<void>.periodic(const Duration(milliseconds: 50))
-        .firstWhere(
-          (_) =>
-              (_playerWidths[playerIndex] ?? 0) > 0 ||
-              (_playerHeights[playerIndex] ?? 0) > 0,
-        );
-    await hasSize.timeout(_videoPrepareWarmupTimeout, onTimeout: () {});
-    await Future<void>.delayed(const Duration(milliseconds: 120));
+    final hasFrame = Stream<void>.periodic(
+      const Duration(milliseconds: 50),
+    ).firstWhere((_) => _playerHasRenderableFrame(playerIndex));
+    await hasFrame.timeout(_videoPrepareWarmupTimeout, onTimeout: () {});
+    await Future<void>.delayed(const Duration(milliseconds: 80));
   }
 
   Future<void> _openVideoOnPlayer(
@@ -913,7 +967,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     String source, {
     required bool play,
     required PlaylistMode playlistMode,
-    double volume = 100,
+    double volume = 0,
   }) async {
     await _videoPlayerConfiguration;
     final player = _players[playerIndex];
@@ -922,7 +976,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await player.setVolume(play ? volume : 0);
     await player.open(Playlist([Media(source)]), play: play);
     if (!play) {
-      await player.seek(Duration.zero);
       await player.pause();
     }
   }
@@ -961,7 +1014,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     try {
       await _players[playerIndex].pause();
-      await _players[playerIndex].seek(Duration.zero);
     } catch (_) {}
     _preparedVideo = _PreparedVideo(
       playerIndex: playerIndex,
@@ -974,6 +1026,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
       'video prepare ready: source=${_sourceLabel(source)} media_id=$mediaId standby_player=$playerIndex seq=$sequence size=${_playerSizeLabel(playerIndex)}',
     );
     if (mounted) setState(() {});
+  }
+
+  Future<void> _retirePlayer(int playerIndex) async {
+    await Future<void>.delayed(_videoRetireDelay);
+    if (_isDisposed || playerIndex == _activeVideoIndex) return;
+    await _stopPlayer(playerIndex);
   }
 
   Future<void> _scheduleVideoPreparation(String source, int mediaId) async {
@@ -1028,7 +1086,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await _players[_activeVideoIndex].setPlaylistMode(
         loopSingle ? PlaylistMode.single : PlaylistMode.none,
       );
-      await _players[_activeVideoIndex].setVolume(100);
+      await _players[_activeVideoIndex].setVolume(_effectiveVideoVolume);
+      _lastAppliedVideoVolume = _effectiveVideoVolume;
       await _players[_activeVideoIndex].play();
       _expectVideoCompleted = !loopSingle;
       _startPlaybackTraceTimer();
@@ -1036,7 +1095,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         'video activate prepared: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prev_player=$previousActive loop_single=$loopSingle media_id=${prepared.mediaId}',
       );
       if (mounted) setState(() => _mode = _Mode.video);
-      unawaited(_stopPlayer(previousActive));
+      unawaited(_retirePlayer(previousActive));
       return;
     }
 
@@ -1060,7 +1119,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       );
       await _waitForVideoWarmup(nextPlayer);
       if (_isDisposed) return;
-      await _players[nextPlayer].setVolume(100);
+      await _players[nextPlayer].setVolume(_effectiveVideoVolume);
+      _lastAppliedVideoVolume = _effectiveVideoVolume;
       _activeVideoIndex = nextPlayer;
       _activeVideoSource = source;
       _warmingVideoIndex = null;
@@ -1070,7 +1130,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         'video transition active: trace=$_activePlaybackTraceId source=${_sourceLabel(source)} player=$_activeVideoIndex prev_player=$previousActive loop_single=$loopSingle size=${_playerSizeLabel(_activeVideoIndex)} tc=${_tcLabel(_playerPositions[_activeVideoIndex], _playerDurations[_activeVideoIndex])}',
       );
       if (mounted) setState(() => _mode = _Mode.video);
-      unawaited(_stopPlayer(previousActive));
+      unawaited(_retirePlayer(previousActive));
       return;
     }
 
@@ -1079,9 +1139,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       source,
       play: true,
       playlistMode: loopSingle ? PlaylistMode.single : PlaylistMode.none,
+      volume: _effectiveVideoVolume,
     );
     await _waitForVideoWarmup(_activeVideoIndex);
     if (_isDisposed) return;
+    _lastAppliedVideoVolume = _effectiveVideoVolume;
     _activeVideoSource = source;
     _expectVideoCompleted = !loopSingle;
     _startPlaybackTraceTimer();
@@ -1102,6 +1164,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     _stopPlaybackTraceTimer();
     _activeVideoSource = null;
+    _lastAppliedVideoVolume = -1;
+    _lastAppliedContentRevision = '';
     for (var i = 0; i < _players.length; i++) {
       await _stopPlayer(i);
     }
@@ -1431,33 +1495,44 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     final slot = _currentSlot;
     final warmupVideoIndex = _preparedVideo?.playerIndex ?? _warmingVideoIndex;
+    final rotationQuarterTurns =
+        Get.find<PlaylistController>().effectiveDisplayRotation ~/ 90;
+    final mediaSurface = Stack(
+      fit: StackFit.expand,
+      children: [
+        if (_mode == _Mode.image && _imagePath.isNotEmpty) _buildImageView(),
+        for (var i = 0; i < _videoControllers.length; i++)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: Opacity(
+                opacity: _mode == _Mode.video && i == _activeVideoIndex
+                    ? 1
+                    : i == warmupVideoIndex
+                    ? 0.001
+                    : 0,
+                child: RepaintBoundary(
+                  child: Video(
+                    controller: _videoControllers[i],
+                    fit: BoxFit.contain,
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (_mode == _Mode.image && _imagePath.isNotEmpty)
-            _buildImageView()
-          else if (_mode != _Mode.video && warmupVideoIndex == null)
-            const SizedBox.shrink(),
-
-          for (var i = 0; i < _videoControllers.length; i++)
-            if ((_mode == _Mode.video && i == _activeVideoIndex) ||
-                i == warmupVideoIndex)
-              Positioned.fill(
-                child: IgnorePointer(
-                  child: Opacity(
-                    opacity: _mode == _Mode.video && i == _activeVideoIndex
-                        ? 1
-                        : 0.001,
-                    child: Video(
-                      controller: _videoControllers[i],
-                      fit: BoxFit.contain,
-                    ),
-                  ),
-                ),
-              ),
+          Positioned.fill(
+            child: RotatedBox(
+              quarterTurns: rotationQuarterTurns,
+              child: mediaSurface,
+            ),
+          ),
 
           // ===== ДОБАВЛЕНО: кнопка редактора при наведении мыши =====
           // Новый исправленный код:
@@ -1544,6 +1619,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _debugTimer?.cancel();
     _playbackTraceTimer?.cancel();
     _prepareVideoTimer?.cancel();
+    _controllerVersionWorker?.dispose();
     HardwareKeyboard.instance.removeHandler(_onKey);
     for (final player in _players) {
       player.dispose();

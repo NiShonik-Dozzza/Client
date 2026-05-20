@@ -45,8 +45,10 @@ dependencies:
   crypto: ^3.0.6
   window_manager: ^0.4.3
   # для эдитора
-  file_picker: ^8.0.0+1
+  file_picker:
+    path: third_party/flutter_plugins/file_picker
   intl: ^0.19.0
+  screen_retriever: ^0.2.0
 
 dev_dependencies:
   flutter_test:
@@ -70,6 +72,12 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+dependency_overrides:
+  package_info_plus:
+    path: third_party/flutter_plugins/package_info_plus
+  wakelock_plus:
+    path: third_party/flutter_plugins/wakelock_plus
 
   # To add assets to your application, add an assets section, like this:
   # assets:

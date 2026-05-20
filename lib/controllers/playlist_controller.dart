@@ -6,12 +6,14 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:get/get.dart';
 
+import '../models/display_profile.dart';
 import '../models/manifest.dart';
 import '../models/playlist_item.dart';
 import '../services/api_service.dart';
 import '../services/app_logger.dart';
 import '../services/app_paths.dart';
 import '../services/config_service.dart';
+import '../services/display_service.dart';
 import '../services/device_store.dart';
 import '../services/manifest_store.dart';
 import '../services/media_cache_service.dart';
@@ -28,12 +30,19 @@ class PlaylistController extends GetxController {
   final RxString _serverAddress = ''.obs;
   final RxString _deviceDisplayName = ''.obs;
   final RxBool _setupBusy = false.obs;
+  final RxBool _displayBusy = false.obs;
   final RxString _syncDiagnostics = ''.obs;
+  final RxList<DeviceDisplayProfile> _availableDisplays =
+      <DeviceDisplayProfile>[].obs;
+  final RxString _selectedDisplayId = ''.obs;
+  final RxString _activeDisplayId = ''.obs;
+  final RxInt _localDisplayRotation = 0.obs;
   final RxBool isOfflineMode = false.obs;
 
   final RxList<PlaylistItem> localItems = <PlaylistItem>[].obs;
 
   final _config = ConfigService();
+  final _displayService = DisplayService();
   final _deviceStore = DeviceStore();
   final _manifestStore = ManifestStore();
   late final MediaCacheService _cache;
@@ -63,11 +72,31 @@ class PlaylistController extends GetxController {
   String get deviceDisplayName => _deviceDisplayName.value;
   String get syncDiagnostics => _syncDiagnostics.value;
   bool get setupBusy => _setupBusy.value;
+  bool get displayBusy => _displayBusy.value;
   bool get isReady => _setupStage.value == DeviceSetupStage.ready;
   bool get isPendingApproval =>
       _setupStage.value == DeviceSetupStage.pendingApproval;
   String get deviceId => _auth?.deviceId ?? '';
   Manifest? get manifest => _manifest;
+  List<DeviceDisplayProfile> get availableDisplays =>
+      _availableDisplays.toList(growable: false);
+  String get selectedDisplayId => _selectedDisplayId.value;
+  String get activeDisplayId => _activeDisplayId.value;
+  int get localDisplayRotation => _localDisplayRotation.value;
+  int get effectiveDisplayRotation => _normalizeRotation(
+    _manifest?.display.rotation ?? _localDisplayRotation.value,
+  );
+  String get effectiveDisplayId {
+    final remote = _manifest?.display.targetDisplayId.trim() ?? '';
+    if (remote.isNotEmpty) {
+      return remote;
+    }
+    return _selectedDisplayId.value;
+  }
+
+  bool get audioMuted => _manifest?.playback.audioMuted ?? true;
+  int get masterVolume =>
+      (_manifest?.playback.masterVolume ?? 0).clamp(0, 100).toInt();
   String get currentRevision => _manifest?.revision ?? '';
   List<ManifestItem> get items => _manifest?.items ?? [];
   List<PlaylistItem> get editorItems => localItems.toList();
@@ -92,8 +121,12 @@ class PlaylistController extends GetxController {
       final cfg = await _config.load();
       _mediaRoot = cfg.mediaRoot;
       _serverAddress.value = cfg.serverUrl;
+      _selectedDisplayId.value = cfg.selectedDisplayId;
+      _localDisplayRotation.value = _normalizeRotation(cfg.displayRotation);
       _api = ApiService(serverBase: cfg.serverUrl);
       await _repairServerAddressIfNeeded();
+      await refreshAvailableDisplays(applySelection: false);
+      await applyEffectiveDisplaySelection(force: true);
       _cache = MediaCacheService(
         onForbidden: _fetchManifest,
         tokenProvider: () => _auth?.token,
@@ -588,6 +621,7 @@ class PlaylistController extends GetxController {
         'Manifest updated ($source): rev=${manifest.revision} items=${manifest.items.length}',
       ),
     );
+    unawaited(applyEffectiveDisplaySelection());
   }
 
   void _prefetchMedia(Manifest manifest) {
@@ -679,6 +713,8 @@ class PlaylistController extends GetxController {
         cachedMediaCount: cacheDiagnostics.cachedMediaCount,
         cacheSizeBytes: cacheDiagnostics.cacheSizeBytes,
         mediaDownloadFailures: cacheDiagnostics.downloadFailures,
+        activeDisplayId: _activeDisplayId.value,
+        availableDisplays: availableDisplays,
         token: auth.token,
       );
     } on ApiException catch (e) {
@@ -814,5 +850,162 @@ class PlaylistController extends GetxController {
         .replace(path: '', query: null, fragment: null)
         .toString()
         .replaceFirst(RegExp(r'/$'), '');
+  }
+
+  Future<void> refreshAvailableDisplays({bool applySelection = true}) async {
+    _displayBusy.value = true;
+    try {
+      final displays = await _displayService.getAvailableDisplays();
+      final desired = _selectedDisplayId.value;
+      final fallback = _resolveAvailableDisplay(displays, desired);
+      _availableDisplays.assignAll(
+        displays
+            .map(
+              (display) => display.copyWith(
+                isCurrent: fallback != null && display.id == fallback.id,
+              ),
+            )
+            .toList(growable: false),
+      );
+      if (desired.isEmpty && fallback != null) {
+        _selectedDisplayId.value = fallback.id;
+        await _config.setDisplayPreferences(selectedDisplayId: fallback.id);
+      }
+      if (applySelection) {
+        await applyEffectiveDisplaySelection();
+      }
+    } finally {
+      _displayBusy.value = false;
+    }
+  }
+
+  Future<void> updateLocalDisplayPreferences({
+    String? selectedDisplayId,
+    int? rotation,
+  }) async {
+    if (selectedDisplayId != null) {
+      _selectedDisplayId.value = selectedDisplayId.trim();
+    }
+    if (rotation != null) {
+      _localDisplayRotation.value = _normalizeRotation(rotation);
+    }
+    await _config.setDisplayPreferences(
+      selectedDisplayId: _selectedDisplayId.value,
+      displayRotation: _localDisplayRotation.value,
+    );
+    await applyEffectiveDisplaySelection(force: true);
+    version.value++;
+  }
+
+  Future<void> applyEffectiveDisplaySelection({bool force = false}) async {
+    final displays = _availableDisplays.toList(growable: false);
+    if (displays.isEmpty) {
+      _activeDisplayId.value = '';
+      return;
+    }
+
+    final fallback = _resolveAvailableDisplay(displays, effectiveDisplayId);
+    if (fallback == null) {
+      _activeDisplayId.value = '';
+      return;
+    }
+
+    final shouldApply = force || _activeDisplayId.value != fallback.id;
+    if (shouldApply) {
+      await _displayService.applyTargetDisplay(fallback.id);
+    }
+    _activeDisplayId.value = fallback.id;
+    _availableDisplays.assignAll(
+      displays
+          .map(
+            (display) => display.copyWith(isCurrent: display.id == fallback.id),
+          )
+          .toList(growable: false),
+    );
+  }
+
+  Future<bool> rebindServer(String rawServerAddress) async {
+    final normalizedServer = _normalizeServerAddress(rawServerAddress);
+    if (normalizedServer.isEmpty) {
+      _setSetupRequired('Введите адрес сервера.');
+      return false;
+    }
+
+    _setupBusy.value = true;
+    try {
+      final (resolvedServer, _) = await _resolveServerBaseWithHealth(
+        normalizedServer,
+      );
+      final current = _normalizeServerAddress(_serverAddress.value);
+      _serverAddress.value = resolvedServer;
+      _api?.updateServerBase(resolvedServer);
+      await _config.setServerUrl(resolvedServer);
+
+      if (resolvedServer == current) {
+        _setupMessage.value =
+            'Адрес сервера обновлен. Текущая регистрация остается действительной.';
+        return true;
+      }
+
+      _registrationPollTimer?.cancel();
+      _manifestTimer?.cancel();
+      _heartbeatTimer?.cancel();
+      final auth = _auth;
+      if (auth != null) {
+        _auth = auth.copyWith(
+          token: '',
+          requestToken: '',
+          name: _deviceDisplayName.value,
+        );
+        await _deviceStore.save(_auth!);
+      }
+      _manifestFailures = 0;
+      _setSetupRequired(
+        'Сервер изменен. Отправьте новую заявку на регистрацию устройства.',
+      );
+      return true;
+    } catch (e) {
+      await AppLogger.log('server rebind failed: $e');
+      _setSetupRequired(
+        'Не удалось подключиться к новому серверу. Проверьте адрес и повторите.',
+      );
+      return false;
+    } finally {
+      _setupBusy.value = false;
+    }
+  }
+
+  DeviceDisplayProfile? _resolveAvailableDisplay(
+    List<DeviceDisplayProfile> displays,
+    String preferredId,
+  ) {
+    if (displays.isEmpty) {
+      return null;
+    }
+    final normalized = preferredId.trim();
+    if (normalized.isNotEmpty) {
+      for (final display in displays) {
+        if (display.id == normalized) {
+          return display;
+        }
+      }
+    }
+    for (final display in displays) {
+      if (display.isCurrent) {
+        return display;
+      }
+    }
+    for (final display in displays) {
+      if (display.isPrimary) {
+        return display;
+      }
+    }
+    return displays.first;
+  }
+
+  int _normalizeRotation(int value) {
+    const allowed = <int>{0, 90, 180, 270};
+    final normalized = value % 360;
+    return allowed.contains(normalized) ? normalized : 0;
   }
 }

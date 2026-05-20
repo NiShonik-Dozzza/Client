@@ -1,13 +1,18 @@
 import 'package:path/path.dart' as p;
 
 enum ManifestContentType { media, playlist }
+
 enum ManifestLoopMode { none, fill }
 
 class Manifest {
   final String deviceId;
   final String revision;
+  final String contentRevision;
+  final String controlRevision;
   final String timezone;
   final int prefetchSeconds;
+  final ManifestPlaybackSettings playback;
+  final ManifestDisplaySettings display;
   final List<ManifestItem> items;
   final List<ManifestMedia> media;
   final List<ManifestPlaylist> playlists;
@@ -15,8 +20,12 @@ class Manifest {
   Manifest({
     required this.deviceId,
     required this.revision,
+    required this.contentRevision,
+    required this.controlRevision,
     required this.timezone,
     required this.prefetchSeconds,
+    required this.playback,
+    required this.display,
     required this.items,
     required this.media,
     required this.playlists,
@@ -27,24 +36,39 @@ class Manifest {
     final mediaRaw = (json['media'] as List? ?? []).cast<dynamic>();
     final playlistsRaw = (json['playlists'] as List? ?? []).cast<dynamic>();
 
-    final items = itemsRaw
-        .map((e) => ManifestItem.fromJson((e as Map).cast<String, dynamic>()))
-        .toList()
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final items =
+        itemsRaw
+            .map(
+              (e) => ManifestItem.fromJson((e as Map).cast<String, dynamic>()),
+            )
+            .toList()
+          ..sort((a, b) => a.startTime.compareTo(b.startTime));
 
     final media = mediaRaw
         .map((e) => ManifestMedia.fromJson((e as Map).cast<String, dynamic>()))
         .toList();
 
     final playlists = playlistsRaw
-        .map((e) => ManifestPlaylist.fromJson((e as Map).cast<String, dynamic>()))
+        .map(
+          (e) => ManifestPlaylist.fromJson((e as Map).cast<String, dynamic>()),
+        )
         .toList();
 
     return Manifest(
       deviceId: (json['device_id'] as String?)?.trim() ?? '',
       revision: (json['revision'] as String?)?.trim() ?? '',
+      contentRevision: (json['content_revision'] as String?)?.trim() ?? '',
+      controlRevision: (json['control_revision'] as String?)?.trim() ?? '',
       timezone: (json['timezone'] as String?)?.trim() ?? '',
       prefetchSeconds: _asInt(json['prefetch_seconds'], 300),
+      playback: ManifestPlaybackSettings.fromJson(
+        ((json['playback'] as Map?) ?? const <String, dynamic>{})
+            .cast<String, dynamic>(),
+      ),
+      display: ManifestDisplaySettings.fromJson(
+        ((json['display'] as Map?) ?? const <String, dynamic>{})
+            .cast<String, dynamic>(),
+      ),
       items: items,
       media: media,
       playlists: playlists,
@@ -54,8 +78,12 @@ class Manifest {
   Map<String, dynamic> toJson() => {
     'device_id': deviceId,
     'revision': revision,
+    'content_revision': contentRevision,
+    'control_revision': controlRevision,
     'timezone': timezone,
     'prefetch_seconds': prefetchSeconds,
+    'playback': playback.toJson(),
+    'display': display.toJson(),
     'items': items.map((e) => e.toJson()).toList(),
     'media': media.map((e) => e.toJson()).toList(),
     'playlists': playlists.map((e) => e.toJson()).toList(),
@@ -74,6 +102,51 @@ class Manifest {
     }
     return null;
   }
+}
+
+class ManifestPlaybackSettings {
+  const ManifestPlaybackSettings({
+    required this.masterVolume,
+    required this.audioMuted,
+  });
+
+  final int masterVolume;
+  final bool audioMuted;
+
+  factory ManifestPlaybackSettings.fromJson(Map<String, dynamic> json) {
+    return ManifestPlaybackSettings(
+      masterVolume: _asInt(json['master_volume']),
+      audioMuted: json['audio_muted'] != false,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'master_volume': masterVolume,
+    'audio_muted': audioMuted,
+  };
+}
+
+class ManifestDisplaySettings {
+  const ManifestDisplaySettings({
+    required this.targetDisplayId,
+    required this.rotation,
+  });
+
+  final String targetDisplayId;
+  final int? rotation;
+
+  factory ManifestDisplaySettings.fromJson(Map<String, dynamic> json) {
+    final rawRotation = _asNullableInt(json['rotation']);
+    return ManifestDisplaySettings(
+      targetDisplayId: (json['target_display_id'] as String?)?.trim() ?? '',
+      rotation: rawRotation == null ? null : rawRotation % 360,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'target_display_id': targetDisplayId,
+    'rotation': rotation,
+  };
 }
 
 class ManifestItem {
@@ -96,16 +169,22 @@ class ManifestItem {
   });
 
   factory ManifestItem.fromJson(Map<String, dynamic> json) {
-    final contentTypeRaw = (json['content_type'] as String?)?.trim().toLowerCase();
+    final contentTypeRaw = (json['content_type'] as String?)
+        ?.trim()
+        .toLowerCase();
     final loopModeRaw = (json['loop_mode'] as String?)?.trim().toLowerCase();
 
     return ManifestItem(
       eventId: _asNullableInt(json['event_id']),
       startTime: _parseTime(json['start_time'] as String?),
       endTime: _parseTime(json['end_time'] as String?),
-      contentType: contentTypeRaw == 'playlist' ? ManifestContentType.playlist : ManifestContentType.media,
+      contentType: contentTypeRaw == 'playlist'
+          ? ManifestContentType.playlist
+          : ManifestContentType.media,
       contentId: _asInt(json['content_id']),
-      loopMode: loopModeRaw == 'fill' ? ManifestLoopMode.fill : ManifestLoopMode.none,
+      loopMode: loopModeRaw == 'fill'
+          ? ManifestLoopMode.fill
+          : ManifestLoopMode.none,
       priority: _asInt(json['priority']),
     );
   }
@@ -114,13 +193,16 @@ class ManifestItem {
     'event_id': eventId,
     'start_time': startTime.toIso8601String(),
     'end_time': endTime.toIso8601String(),
-    'content_type': contentType == ManifestContentType.playlist ? 'playlist' : 'media',
+    'content_type': contentType == ManifestContentType.playlist
+        ? 'playlist'
+        : 'media',
     'content_id': contentId,
     'loop_mode': loopMode == ManifestLoopMode.fill ? 'fill' : 'none',
     'priority': priority,
   };
 
-  bool isActiveAt(DateTime now) => !now.isBefore(startTime) && now.isBefore(endTime);
+  bool isActiveAt(DateTime now) =>
+      !now.isBefore(startTime) && now.isBefore(endTime);
 }
 
 class ManifestMedia {
@@ -169,7 +251,9 @@ class ManifestMedia {
 
   String get safeBaseName {
     final fromOriginal = p.basename(originalName.trim());
-    if (fromOriginal.isNotEmpty && fromOriginal != '.' && fromOriginal != '..') {
+    if (fromOriginal.isNotEmpty &&
+        fromOriginal != '.' &&
+        fromOriginal != '..') {
       return fromOriginal;
     }
     final fromKey = p.basename(objectKey.trim());
@@ -196,10 +280,15 @@ class ManifestPlaylist {
 
   factory ManifestPlaylist.fromJson(Map<String, dynamic> json) {
     final rawItems = (json['items'] as List? ?? []).cast<dynamic>();
-    final items = rawItems
-        .map((e) => ManifestPlaylistItem.fromJson((e as Map).cast<String, dynamic>()))
-        .toList()
-      ..sort((a, b) => a.position.compareTo(b.position));
+    final items =
+        rawItems
+            .map(
+              (e) => ManifestPlaylistItem.fromJson(
+                (e as Map).cast<String, dynamic>(),
+              ),
+            )
+            .toList()
+          ..sort((a, b) => a.position.compareTo(b.position));
 
     return ManifestPlaylist(
       id: _asInt(json['id']),

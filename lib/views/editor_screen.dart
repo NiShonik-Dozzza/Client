@@ -30,9 +30,11 @@ class _EditorScreenState extends State<EditorScreen> {
   String? _statusMessage;
   Color _statusColor = Colors.blue.shade700;
   IconData _statusIcon = Icons.info_outline;
+  bool _serverBusy = false;
 
   // Поля для нового элемента
   final _filenameCtrl = TextEditingController();
+  final _serverCtrl = TextEditingController();
   DateTime _startDate = DateTime.now();
   DateTime? _stopDate;
   bool _loop = true;
@@ -44,6 +46,7 @@ class _EditorScreenState extends State<EditorScreen> {
   void initState() {
     super.initState();
     _controller = Get.find<PlaylistController>();
+    _serverCtrl.text = _controller.serverAddress;
 
     // Следим за изменением режима в контроллере
     _offlineModeWorker = ever<bool>(_controller.isOfflineMode, (mode) {
@@ -63,6 +66,7 @@ class _EditorScreenState extends State<EditorScreen> {
     _statusTimer?.cancel();
     _scrollController.dispose();
     _filenameCtrl.dispose();
+    _serverCtrl.dispose();
     super.dispose();
   }
 
@@ -137,6 +141,41 @@ class _EditorScreenState extends State<EditorScreen> {
     });
   }
 
+  Future<void> _changeServerOnline() async {
+    if (_serverBusy) return;
+    setState(() {
+      _serverBusy = true;
+    });
+    try {
+      final ok = await _controller.rebindServer(_serverCtrl.text);
+      if (!mounted) return;
+      if (ok) {
+        _showStatus(
+          _controller.setupMessage,
+          color: Colors.green.shade700,
+          icon: Icons.cloud_done_outlined,
+          duration: const Duration(seconds: 4),
+        );
+        if (!_controller.isReady) {
+          Get.back<void>();
+        }
+      }
+    } catch (e) {
+      _showStatus(
+        'Не удалось сменить сервер: $e',
+        color: Colors.red.shade700,
+        icon: Icons.error_outline,
+        duration: const Duration(seconds: 5),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _serverBusy = false;
+        });
+      }
+    }
+  }
+
   Future<void> _pickAndCopyFile() async {
     if (!_isOfflineMode) {
       _showStatus(
@@ -147,7 +186,7 @@ class _EditorScreenState extends State<EditorScreen> {
       return;
     }
 
-    final result = await FilePicker.platform.pickFiles(
+    final result = await FilePicker.pickFiles(
       type: FileType.custom,
       allowedExtensions: [
         'mp4',
@@ -510,6 +549,52 @@ class _EditorScreenState extends State<EditorScreen> {
                     fontWeight: FontWeight.bold,
                     color: Colors.red,
                   ),
+                ),
+              ],
+            ),
+          ),
+
+          Container(
+            color: Colors.white,
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Сервер устройства',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _serverCtrl,
+                        enabled: !_serverBusy,
+                        decoration: const InputDecoration(
+                          labelText: 'Адрес сервера',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    FilledButton.icon(
+                      onPressed: _serverBusy ? null : _changeServerOnline,
+                      icon: _serverBusy
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.sync_alt),
+                      label: const Text('Сменить'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'После смены сервера устройство заново проходит регистрацию на новом контуре.',
+                  style: TextStyle(color: Colors.grey.shade700, fontSize: 12),
                 ),
               ],
             ),

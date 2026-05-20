@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../models/display_profile.dart';
 import '../models/manifest.dart';
 
 class ApiException implements Exception {
@@ -163,6 +164,8 @@ class ApiService {
     required int cachedMediaCount,
     required int cacheSizeBytes,
     required int mediaDownloadFailures,
+    required String activeDisplayId,
+    required List<DeviceDisplayProfile> availableDisplays,
     String? token,
   }) async {
     final resp = await _client.post(
@@ -177,6 +180,10 @@ class ApiService {
         'cached_media_count': cachedMediaCount,
         'cache_size_bytes': cacheSizeBytes,
         'media_download_failures': mediaDownloadFailures,
+        'active_display_id': activeDisplayId,
+        'available_displays': availableDisplays
+            .map((item) => item.toJson())
+            .toList(),
       }),
     );
     _decodeMap(resp);
