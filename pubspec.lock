@@ -158,12 +158,11 @@ packages:
     source: hosted
     version: "5.0.0"
   flutter_plugin_android_lifecycle:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
-      name: flutter_plugin_android_lifecycle
-      sha256: "38d1c268de9097ff59cf0e844ac38759fc78f76836d37edad06fa21e182055a0"
-      url: "https://pub.dev"
-    source: hosted
+      path: "third_party/flutter_plugins/flutter_plugin_android_lifecycle"
+      relative: true
+    source: path
     version: "2.0.34"
   flutter_test:
     dependency: "direct dev"
@@ -652,7 +651,7 @@ packages:
     source: hosted
     version: "15.0.2"
   wakelock_plus:
-    dependency: "direct overridden"
+    dependency: "direct main"
     description:
       path: "third_party/flutter_plugins/wakelock_plus"
       relative: true

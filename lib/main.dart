@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:media_kit/media_kit.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'controllers/playlist_controller.dart';
@@ -14,6 +15,7 @@ import 'views/player_screen.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
+  await _configurePowerPolicy();
   await _configureAppWindow();
 
   Get.put(PlaylistController(), permanent: true);
@@ -26,10 +28,18 @@ class App extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const GetMaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: WindowShell(child: RootScreen()),
+    return const PowerGuard(
+      child: GetMaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: WindowShell(child: RootScreen()),
+      ),
     );
+  }
+}
+
+Future<void> _configurePowerPolicy() async {
+  if (!kIsWeb && (Platform.isAndroid || Platform.isWindows || Platform.isLinux)) {
+    await WakelockPlus.enable();
   }
 }
 
@@ -87,6 +97,47 @@ class WindowShell extends StatefulWidget {
 
   @override
   State<WindowShell> createState() => _WindowShellState();
+}
+
+class PowerGuard extends StatefulWidget {
+  const PowerGuard({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  State<PowerGuard> createState() => _PowerGuardState();
+}
+
+class _PowerGuardState extends State<PowerGuard> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _reapplyPowerPolicy();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _reapplyPowerPolicy();
+    }
+  }
+
+  Future<void> _reapplyPowerPolicy() async {
+    await _configurePowerPolicy();
+    if (!kIsWeb && Platform.isAndroid) {
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 
 class _WindowShellState extends State<WindowShell> {

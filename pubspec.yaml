@@ -44,6 +44,7 @@ dependencies:
   http: ^1.4.0
   crypto: ^3.0.6
   window_manager: ^0.4.3
+  wakelock_plus: ^1.4.0
   # для эдитора
   file_picker:
     path: third_party/flutter_plugins/file_picker
@@ -74,6 +75,8 @@ flutter:
   uses-material-design: true
 
 dependency_overrides:
+  flutter_plugin_android_lifecycle:
+    path: third_party/flutter_plugins/flutter_plugin_android_lifecycle
   package_info_plus:
     path: third_party/flutter_plugins/package_info_plus
   wakelock_plus:
