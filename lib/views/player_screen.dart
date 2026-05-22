@@ -584,7 +584,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<bool> _checkPinIfRequired() async {
-    final pin = _controller.servicePin;
+    final pin = Get.find<PlaylistController>().servicePin;
     if (pin.isEmpty) return true;
     final entered = await Get.dialog<String>(
       const _PinDialog(),
