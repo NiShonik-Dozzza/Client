@@ -102,22 +102,27 @@ jobs:
           channel: stable
           cache: true
 
-      # Декодируем keystore из GitHub Secret (base64)
-      - name: Decode keystore
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+      # Декодируем keystore и создаём key.properties из GitHub Secrets.
+      # Если секреты не заданы — APK будет подписан debug-ключом.
+      - name: Setup signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode \
-            > android/app/efir-release.jks
-
-      - name: Create key.properties
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
-        run: |
-          cat > android/key.properties <<EOF
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > android/app/efir-release.jks
+            cat > android/key.properties <<EOF
           storeFile=efir-release.jks
-          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
-          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          storePassword=$KEYSTORE_PASS
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASS
           EOF
+            echo "Release signing configured."
+          else
+            echo "No keystore secrets found — will use debug signing."
+          fi
 
       - name: Build APK (arm64 — для большинства устройств и Android TV)
         run: |
