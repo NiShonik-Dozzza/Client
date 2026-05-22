@@ -88,7 +88,73 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     Flags: uninsdeletevalue; Tasks: not desktopicon
 
 [Code]
-// Проверка при деинсталляции: остановить процесс если запущен
+var
+  VCRedistPage: TDownloadWizardPage;
+
+// Проверяем наличие VC++ 2015-2022 Redistributable x64 через реестр
+function VCRedistNeedsInstall: Boolean;
+var
+  Ver: String;
+begin
+  Result := not RegQueryStringValue(
+    HKLM,
+    'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
+    'Version',
+    Ver
+  );
+end;
+
+// Создаём страницу загрузки при запуске мастера установки
+procedure InitializeWizard;
+begin
+  VCRedistPage := CreateDownloadPage(
+    'Подготовка к установке',
+    'Загрузка Visual C++ Runtime с серверов Microsoft...',
+    nil
+  );
+end;
+
+// Перед установкой: скачиваем и устанавливаем VC++ если его нет
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Result := '';
+  if not VCRedistNeedsInstall then
+    Exit;
+
+  VCRedistPage.Clear;
+  VCRedistPage.Add(
+    'https://aka.ms/vs/17/release/vc_redist.x64.exe',
+    'vc_redist.x64.exe',
+    ''
+  );
+  VCRedistPage.Show;
+  try
+    try
+      VCRedistPage.Download;
+      Exec(
+        ExpandConstant('{tmp}\vc_redist.x64.exe'),
+        '/install /quiet /norestart',
+        '',
+        SW_HIDE,
+        ewWaitUntilTerminated,
+        ResultCode
+      );
+      if ResultCode <> 0 then
+        Result := 'Не удалось установить Visual C++ Runtime (код: ' + IntToStr(ResultCode) + ').' +
+                  #13#10 + 'Установите вручную: https://aka.ms/vs/17/release/vc_redist.x64.exe';
+    except
+      Result := 'Ошибка загрузки Visual C++ Runtime.' +
+                #13#10 + 'Проверьте интернет-соединение или установите вручную:' +
+                #13#10 + 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
+    end;
+  finally
+    VCRedistPage.Hide;
+  end;
+end;
+
+// Остановить процесс при деинсталляции
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
