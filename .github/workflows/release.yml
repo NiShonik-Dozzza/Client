@@ -74,9 +74,12 @@ jobs:
         run: flutter build linux --release
 
       - name: Build tarball
+        env:
+          EFIR_VERSION: ${{ github.ref_name }}
         run: |
+          EFIR_VERSION="${EFIR_VERSION#v}"   # убираем 'v' из тега
           chmod +x packaging/linux/build-tar.sh
-          bash packaging/linux/build-tar.sh
+          EFIR_VERSION="$EFIR_VERSION" bash packaging/linux/build-tar.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -132,6 +135,7 @@ jobs:
       - name: Rename APK with version
         run: |
           VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"   # убираем 'v' из тега
           mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
              build/app/outputs/flutter-apk/efir-${VERSION}-android-arm64.apk
 

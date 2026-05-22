@@ -13,7 +13,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-VERSION=$(grep '^version:' "$REPO_ROOT/pubspec.yaml" | sed 's/version: //;s/+.*//' | tr -d '[:space:]')
+# В CI версия передаётся через переменную окружения EFIR_VERSION (из git tag).
+# При локальной сборке берётся из pubspec.yaml.
+VERSION="${EFIR_VERSION:-$(grep '^version:' "$REPO_ROOT/pubspec.yaml" | sed 's/version: //;s/+.*//' | tr -d '[:space:]')}"
 ARCH="amd64"
 PKG_NAME="efir-client_${VERSION}_linux_${ARCH}"
 FLUTTER_BUILD="$REPO_ROOT/build/linux/x64/release/bundle"
