@@ -5,15 +5,18 @@
 ### Быстрая установка
 
 ```bash
-# 1. Собрать приложение
+# 1. Собрать архив (или скачать с GitHub Releases)
 flutter build linux --release
+bash packaging/linux/build-tar.sh
+# → packaging/linux/output/efir-client_1.0.0_linux_amd64.tar.gz
 
-# 2. Скопировать на устройство (замените IP и путь)
-rsync -av build/linux/x64/release/bundle/ kiosk@192.168.1.100:/opt/efir-client/
+# 2. Скопировать на устройство
+scp packaging/linux/output/*.tar.gz kiosk@192.168.1.100:~
 
-# 3. На устройстве — установить сервис
-chmod +x deploy/linux/install-service.sh
-./deploy/linux/install-service.sh /opt/efir-client/efir
+# 3. На устройстве — распаковать и установить
+ssh kiosk@192.168.1.100
+tar xzf efir-client_*.tar.gz
+sudo ./efir-client_*/install.sh kiosk
 ```
 
 ### Автологин пользователя kiosk
@@ -36,9 +39,9 @@ autologin-user-timeout=0
 ### Управление сервисом
 
 ```bash
-systemctl --user status efir-client     # состояние
+systemctl --user status  efir-client    # состояние
 systemctl --user restart efir-client    # перезапуск
-journalctl --user -u efir-client -f     # логи в реальном времени
+journalctl --user -u     efir-client -f # логи в реальном времени
 ```
 
 ---

@@ -46,11 +46,11 @@ flutter build windows --release
 # → packaging\windows\Output\efir-setup-1.0.0-windows-x64.exe
 ```
 
-### Linux .deb
+### Linux (универсальный архив)
 ```bash
 flutter build linux --release
-bash packaging/linux/build-deb.sh
-# → packaging/linux/output/efir-client_1.0.0_amd64.deb
+bash packaging/linux/build-tar.sh
+# → packaging/linux/output/efir-client_1.0.0_linux_amd64.tar.gz
 ```
 
 ### Android APK
@@ -75,5 +75,5 @@ flutter build apk --release --target-platform android-arm64 --split-per-abi
 | Платформа | Файл | Установка |
 |---|---|---|
 | Windows 10/11 | `efir-setup-X.Y.Z-windows-x64.exe` | Запустить от администратора, watchdog регистрируется автоматически |
-| Ubuntu/Debian | `efir-client_X.Y.Z_amd64.deb` | `sudo EFIR_USER=kiosk dpkg -i *.deb` |
+| Linux (любой дистрибутив) | `efir-client_X.Y.Z_linux_amd64.tar.gz` | `tar xzf *.tar.gz && sudo ./*linux*/install.sh kiosk` |
 | Android / Android TV | `efir-X.Y.Z-android-arm64.apk` | `adb install -r *.apk` или через MDM |
