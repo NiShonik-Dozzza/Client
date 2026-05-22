@@ -14,6 +14,8 @@ class SetupScreen extends StatefulWidget {
 class _SetupScreenState extends State<SetupScreen> {
   late final TextEditingController _serverController;
   late final TextEditingController _nameController;
+  late final TextEditingController _pinController;
+  bool _pinSaved = false;
 
   PlaylistController get _controller => Get.find<PlaylistController>();
 
@@ -24,13 +26,24 @@ class _SetupScreenState extends State<SetupScreen> {
     _nameController = TextEditingController(
       text: _controller.deviceDisplayName,
     );
+    _pinController = TextEditingController(text: _controller.servicePin);
   }
 
   @override
   void dispose() {
     _serverController.dispose();
     _nameController.dispose();
+    _pinController.dispose();
     super.dispose();
+  }
+
+  Future<void> _savePin() async {
+    await _controller.setServicePin(_pinController.text.trim());
+    if (!mounted) return;
+    setState(() => _pinSaved = true);
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _pinSaved = false);
+    });
   }
 
   Future<void> _checkConnection() async {
@@ -82,7 +95,10 @@ class _SetupScreenState extends State<SetupScreen> {
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, viewportConstraints) {
-            return SingleChildScrollView(
+            return FocusTraversalGroup(
+              // Позволяет D-pad на Android TV переключать фокус между полями ввода
+              policy: OrderedTraversalPolicy(),
+              child: SingleChildScrollView(
               padding: const EdgeInsets.all(24),
               child: ConstrainedBox(
                 constraints: BoxConstraints(
@@ -306,15 +322,118 @@ class _SetupScreenState extends State<SetupScreen> {
                               ],
                             ),
                           ),
+                          const SizedBox(height: 24),
+                          _PinSetupCard(
+                            controller: _pinController,
+                            saved: _pinSaved,
+                            onSave: _savePin,
+                          ),
                         ],
                       );
                     }),
                   ),
                 ),
               ),
-            );
-          },
+            ),  // close SingleChildScrollView
+          );    // close FocusTraversalGroup
+          },    // close LayoutBuilder builder
         ),
+      ),
+    );
+  }
+}
+
+class _PinSetupCard extends StatefulWidget {
+  const _PinSetupCard({
+    required this.controller,
+    required this.saved,
+    required this.onSave,
+  });
+
+  final TextEditingController controller;
+  final bool saved;
+  final VoidCallback onSave;
+
+  @override
+  State<_PinSetupCard> createState() => _PinSetupCardState();
+}
+
+class _PinSetupCardState extends State<_PinSetupCard> {
+  bool _obscure = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: const Color(0xFFD8DFEA)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x14000000),
+            blurRadius: 24,
+            offset: Offset(0, 12),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.lock_outline, size: 20, color: Color(0xFF1F2533)),
+              const SizedBox(width: 8),
+              Text(
+                'Сервисный PIN-код',
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: const Color(0xFF1F2533),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Защищает вход в редактор плейлиста на устройстве. Оставьте пустым, чтобы отключить защиту.',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: const Color(0xFF5F6B84),
+            ),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: widget.controller,
+            obscureText: _obscure,
+            keyboardType: TextInputType.number,
+            decoration: InputDecoration(
+              labelText: 'PIN-код',
+              hintText: 'Например: 1234',
+              border: const OutlineInputBorder(),
+              suffixIcon: IconButton(
+                icon: Icon(_obscure ? Icons.visibility_off : Icons.visibility),
+                onPressed: () => setState(() => _obscure = !_obscure),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton.icon(
+              onPressed: widget.onSave,
+              icon: Icon(
+                widget.saved ? Icons.check : Icons.save_outlined,
+                size: 18,
+              ),
+              label: Text(widget.saved ? 'Сохранено' : 'Сохранить PIN'),
+              style: FilledButton.styleFrom(
+                backgroundColor: widget.saved
+                    ? Colors.green.shade600
+                    : null,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

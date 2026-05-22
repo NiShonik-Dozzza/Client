@@ -1,0 +1,18 @@
+#!/bin/sh
+# prerm — запускается перед удалением пакета
+set -e
+
+# Остановить и отключить сервис у всех пользователей у которых он активен
+for uid_dir in /run/user/*/; do
+    uid=$(basename "$uid_dir")
+    user=$(id -nu "$uid" 2>/dev/null || true)
+    [ -z "$user" ] && continue
+
+    su - "$user" -c "
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        systemctl --user stop  efir-client.service 2>/dev/null || true
+        systemctl --user disable efir-client.service 2>/dev/null || true
+    " 2>/dev/null || true
+done
+
+#DEBHELPER#

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android TV launcher banner (320x180dp).
+    ЗАМЕНИТЕ этот файл на реальный PNG-баннер (320x180px) перед релизом.
+    Рекомендуется: брендированный горизонтальный логотип на тёмном фоне.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#0D1B2A"/>
+        </shape>
+    </item>
+    <item android:left="40dp" android:top="60dp" android:right="40dp" android:bottom="60dp">
+        <shape android:shape="rectangle">
+            <solid android:color="#1565C0"/>
+            <corners android:radius="4dp"/>
+        </shape>
+    </item>
+</layer-list>

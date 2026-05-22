@@ -1,0 +1,38 @@
+#!/bin/sh
+# postinst — запускается после установки пакета
+set -e
+
+APP_USER="${EFIR_USER:-${PANEL_USER:-}}"
+SERVICE_SOURCE="/usr/lib/systemd/user/efir-client.service"
+
+# Убедиться что права на бинарник правильные
+chmod 755 /opt/efir-client/efir
+
+# Активировать systemd user-сервис для указанного пользователя
+# Переменная EFIR_USER задаётся при установке:
+#   sudo EFIR_USER=kiosk dpkg -i efir-client_*.deb
+if [ -n "$APP_USER" ] && id "$APP_USER" >/dev/null 2>&1; then
+    echo "Активирую сервис для пользователя: $APP_USER"
+    su - "$APP_USER" -c "
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        systemctl --user daemon-reload
+        systemctl --user enable efir-client.service
+        loginctl enable-linger \$(whoami) 2>/dev/null || true
+    " || true
+    echo "Готово. Сервис запустится при следующем входе $APP_USER."
+else
+    echo ""
+    echo "=== EFIR Client установлен ==="
+    echo ""
+    echo "Для настройки автозапуска выполните от имени kiosk-пользователя:"
+    echo ""
+    echo "  systemctl --user daemon-reload"
+    echo "  systemctl --user enable efir-client.service"
+    echo "  systemctl --user start efir-client.service"
+    echo ""
+    echo "Или задайте пользователя при установке:"
+    echo "  sudo EFIR_USER=kiosk dpkg -i efir-client_*.deb"
+    echo ""
+fi
+
+#DEBHELPER#

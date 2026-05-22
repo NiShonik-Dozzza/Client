@@ -1,0 +1,13 @@
+Package: efir-client
+Version: 1.0.0
+Architecture: amd64
+Maintainer: YourCompany <support@yourcompany.com>
+Depends: libgtk-3-0, libblkid1, liblzma5, libglib2.0-0
+Recommends: xorg | wayland-protocols
+Section: misc
+Priority: optional
+Homepage: https://yourcompany.com
+Description: EFIR Digital Signage Client
+ Клиент системы управления цифровыми вывесками EFIR.
+ Воспроизводит медиаконтент согласно расписанию с сервера EFIR.
+ Поддерживает видео, изображения, оффлайн-режим и автоматическую синхронизацию.

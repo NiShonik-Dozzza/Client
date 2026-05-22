@@ -8,12 +8,14 @@ class AppConfig {
   final String serverUrl;
   final String selectedDisplayId;
   final int displayRotation;
+  final String servicePin;
 
   AppConfig({
     required this.mediaRoot,
     required this.serverUrl,
     required this.selectedDisplayId,
     required this.displayRotation,
+    this.servicePin = '',
   });
 
   String get apiBase {
@@ -27,6 +29,7 @@ class AppConfig {
     if (selectedDisplayId.isNotEmpty) 'selected_display_id': selectedDisplayId,
     'display_rotation': displayRotation,
     if (serverUrl.isNotEmpty) 'api_base': apiBase,
+    if (servicePin.isNotEmpty) 'service_pin': servicePin,
   };
 
   static AppConfig defaults(String docsMediaDir) {
@@ -41,6 +44,8 @@ class AppConfig {
 
 class ConfigService {
   AppConfig? _cached;
+
+  AppConfig? get cached => _cached;
 
   Future<AppConfig> load() async {
     if (_cached != null) return _cached!;
@@ -67,6 +72,7 @@ class ConfigService {
       final displayRotation = _normalizeRotation(
         _asInt(map['display_rotation']),
       );
+      final servicePin = (map['service_pin'] as String?)?.trim() ?? '';
       final cfg = AppConfig(
         mediaRoot: (mediaRoot == null || mediaRoot.isEmpty)
             ? defaultConfig.mediaRoot
@@ -74,6 +80,7 @@ class ConfigService {
         serverUrl: serverUrl,
         selectedDisplayId: selectedDisplayId,
         displayRotation: displayRotation,
+        servicePin: servicePin,
       );
       _cached = cfg;
       await AppLogger.log(
@@ -120,6 +127,21 @@ class ConfigService {
 
   Future<void> setApiBase(String newBase) async {
     await setServerUrl(_extractServerUrl('', newBase));
+  }
+
+  Future<void> setServicePin(String pin) async {
+    final file = await AppPaths.configFile();
+    final current = _cached ?? await load();
+    final cfg = AppConfig(
+      mediaRoot: current.mediaRoot,
+      serverUrl: current.serverUrl,
+      selectedDisplayId: current.selectedDisplayId,
+      displayRotation: current.displayRotation,
+      servicePin: pin.trim(),
+    );
+    await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
+    _cached = cfg;
+    await AppLogger.log('Config updated: service_pin=${pin.isEmpty ? "cleared" : "set"}');
   }
 
   Future<void> setDisplayPreferences({

@@ -21,7 +21,7 @@ import '../services/media_cache_service.dart';
 enum DeviceSetupStage { booting, setupRequired, pendingApproval, ready }
 
 class PlaylistController extends GetxController {
-  static const String _clientVersion = 'panel-client 1.0.0+1';
+  static const String _clientVersion = 'efir-client 1.0.0+1';
 
   final RxBool _isLoading = false.obs;
   final RxInt version = 0.obs;
@@ -100,6 +100,7 @@ class PlaylistController extends GetxController {
   String get currentRevision => _manifest?.revision ?? '';
   List<ManifestItem> get items => _manifest?.items ?? [];
   List<PlaylistItem> get editorItems => localItems.toList();
+  String get servicePin => _config.cached?.servicePin ?? '';
 
   @override
   void onInit() {
@@ -622,6 +623,13 @@ class PlaylistController extends GetxController {
       ),
     );
     unawaited(applyEffectiveDisplaySelection());
+    _pruneCache(manifest);
+  }
+
+  void _pruneCache(Manifest manifest) {
+    if (_mediaRoot.isEmpty) return;
+    final neededIds = manifest.media.map((m) => m.id).toSet();
+    unawaited(_cache.pruneUnused(neededIds, _mediaRoot));
   }
 
   void _prefetchMedia(Manifest manifest) {
@@ -895,6 +903,10 @@ class PlaylistController extends GetxController {
     );
     await applyEffectiveDisplaySelection(force: true);
     version.value++;
+  }
+
+  Future<void> setServicePin(String pin) async {
+    await _config.setServicePin(pin);
   }
 
   Future<void> applyEffectiveDisplaySelection({bool force = false}) async {

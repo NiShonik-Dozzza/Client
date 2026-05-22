@@ -1,0 +1,17 @@
+# Скопируйте этот файл в android/key.properties и заполните реальными значениями.
+# ВАЖНО: android/key.properties НЕ должен попасть в git — добавьте его в .gitignore.
+#
+# Создание keystore (выполнить один раз):
+#   keytool -genkey -v -keystore efir-release.jks \
+#           -keyalg RSA -keysize 2048 -validity 10000 \
+#           -alias efir
+#
+# Для CI: закодируйте keystore в base64 и добавьте в GitHub Secrets:
+#   base64 -w 0 efir-release.jks
+#   → Secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+#              ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+
+storeFile=efir-release.jks
+storePassword=your-keystore-password
+keyAlias=efir
+keyPassword=your-key-password

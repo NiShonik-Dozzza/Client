@@ -1,11 +1,23 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id("com.android.application")
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Читаем параметры подписи из android/key.properties (файл НЕ в git).
+// В CI файл создаётся workflow из GitHub Secrets.
+// Локально: скопируйте android/key.properties.example → key.properties и заполните.
+val keyPropertiesFile = rootProject.file("key.properties")
+val keyProperties = Properties().apply {
+    if (keyPropertiesFile.exists()) load(FileInputStream(keyPropertiesFile))
+}
+
 android {
-    namespace = "com.example.panel"
+    // TODO: Замените на ваш реальный package name.
+    // Например: com.yourcompany.panelclient
+    namespace = "com.efir.client"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -14,12 +26,25 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    signingConfigs {
+        create("release") {
+            if (keyPropertiesFile.exists()) {
+                keyAlias     = keyProperties["keyAlias"]     as String
+                keyPassword  = keyProperties["keyPassword"]  as String
+                storeFile    = file(keyProperties["storeFile"] as String)  // efir-release.jks
+                storePassword = keyProperties["storePassword"] as String
+            }
+            // Если key.properties нет — Gradle упадёт при release-сборке.
+            // В CI файл всегда создаётся workflow'ом.
+        }
+    }
+
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.panel"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // TODO: Замените на ваш реальный Application ID.
+        applicationId = "com.efir.client"
+
+        // media_kit требует минимум Android 6.0 (API 23).
+        minSdk = 23
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -27,9 +52,10 @@ android {
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (keyPropertiesFile.exists())
+                signingConfigs.getByName("release")
+            else
+                signingConfigs.getByName("debug")  // fallback для локальной разработки
         }
     }
 }

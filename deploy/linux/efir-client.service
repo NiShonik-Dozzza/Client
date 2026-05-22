@@ -1,0 +1,32 @@
+[Unit]
+Description=EFIR Digital Signage Client
+Documentation=https://github.com/yourorg/efir-client
+# Запускается после того, как появился графический сеанс (X11 или Wayland) и сеть
+After=graphical-session.target network-online.target
+Wants=graphical-session.target network-online.target
+
+[Service]
+Type=simple
+
+# Путь к бинарнику — замените перед установкой
+ExecStart=/opt/efir-client/efir
+
+# Перезапускать при любом завершении (crash, clean exit, SIGTERM)
+Restart=always
+RestartSec=5
+
+# Защита от бесконечных быстрых перезапусков: максимум 10 за 60 секунд,
+# после чего systemd прекращает попытки (для диагностики проблемы)
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Прокинуть переменные дисплея из пользовательской сессии
+# X11: DISPLAY=:0, Wayland: WAYLAND_DISPLAY=wayland-0
+PassEnvironment=DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR
+
+# Логировать в journald (journalctl --user -u efir-client -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

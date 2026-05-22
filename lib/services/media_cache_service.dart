@@ -281,6 +281,52 @@ class MediaCacheService {
     }
   }
 
+  /// Удаляет кэшированные файлы, которых нет в текущем манифесте.
+  /// Вызывать после успешного получения нового манифеста.
+  Future<void> pruneUnused(Set<int> neededIds, String mediaRoot) async {
+    final dir = Directory(mediaRoot);
+    if (!await dir.exists()) return;
+
+    final removed = <int>[];
+    await for (final entry in dir.list()) {
+      if (entry is! File) continue;
+      final name = p.basename(entry.path);
+      if (!name.startsWith('media_')) continue;
+
+      final parts = name.split('_');
+      if (parts.length < 3) continue;
+      final id = int.tryParse(parts[1]);
+      if (id == null) continue;
+
+      if (!neededIds.contains(id)) {
+        try {
+          await entry.delete();
+          removed.add(id);
+        } catch (e) {
+          await AppLogger.log('Cache prune error id=$id: $e');
+        }
+      }
+    }
+
+    if (removed.isNotEmpty) {
+      await AppLogger.log('Cache pruned: removed ids=$removed');
+      final index = await _validationIndex(mediaRoot);
+      for (final id in removed) {
+        index.remove(id);
+      }
+      final payload = <String, dynamic>{
+        for (final entry in index.entries) '${entry.key}': entry.value.toJson(),
+      };
+      try {
+        await File(
+          p.join(Directory(mediaRoot).absolute.path, '.media_cache_index.json'),
+        ).writeAsString(jsonEncode(payload));
+      } catch (e) {
+        await AppLogger.log('Cache index update after prune error: $e');
+      }
+    }
+  }
+
   Duration _backoffDelay(int attempt) {
     final index = (attempt - 1).clamp(0, _downloadBackoffSeconds.length - 1);
     final base = Duration(seconds: _downloadBackoffSeconds[index]);

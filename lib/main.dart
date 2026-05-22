@@ -17,10 +17,25 @@ Future<void> main() async {
   MediaKit.ensureInitialized();
   await _configurePowerPolicy();
   await _configureAppWindow();
+  _registerSignalHandlers();
 
   Get.put(PlaylistController(), permanent: true);
 
   runApp(const App());
+}
+
+/// Graceful shutdown при получении SIGTERM от systemd / watchdog.
+/// Даёт GetX-контроллерам время на сохранение состояния перед выходом.
+void _registerSignalHandlers() {
+  if (kIsWeb) return;
+  if (!Platform.isLinux && !Platform.isMacOS) return; // SIGTERM — только Unix
+
+  ProcessSignal.sigterm.watch().listen((_) async {
+    try {
+      Get.find<PlaylistController>().onClose();
+    } catch (_) {}
+    exit(0);
+  });
 }
 
 class App extends StatelessWidget {
@@ -55,7 +70,7 @@ Future<void> _configureAppWindow() async {
     await windowManager.ensureInitialized();
 
     const windowOptions = WindowOptions(
-      title: 'panel',
+      title: 'EFIR',
       backgroundColor: Colors.black,
     );
 

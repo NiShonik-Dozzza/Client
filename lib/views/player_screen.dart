@@ -533,25 +533,69 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _boot();
   }
 
+  // TV remote: отслеживаем быстрые нажатия кнопки "назад" для сервисного меню
+  int _backPressCount = 0;
+  DateTime? _lastBackPressAt;
+
   bool _onKey(KeyEvent e) {
     if (e is KeyDownEvent) {
-      // F12: переключить отладку
-      if (e.logicalKey == LogicalKeyboardKey.f12) {
+      // F12 / Settings: переключить отладку
+      if (e.logicalKey == LogicalKeyboardKey.f12 ||
+          e.logicalKey == LogicalKeyboardKey.settings) {
         setState(() => _debug = !_debug);
         return true;
       }
 
-      // F2: открыть редактор (только если не открыт)
+      // F2 / Menu: открыть редактор (десктоп клавиши)
       if (!_isEditorOpen && e.logicalKey == LogicalKeyboardKey.f2) {
         _openEditor();
         return true;
+      }
+
+      // Android TV remote: кнопка Menu открывает сервисный редактор
+      if (!_isEditorOpen && e.logicalKey == LogicalKeyboardKey.contextMenu) {
+        _openEditor();
+        return true;
+      }
+
+      // Android TV remote: 5 быстрых нажатий Back → сервисный редактор
+      // (защита от случайного открытия; PIN добавляет второй уровень)
+      if (e.logicalKey == LogicalKeyboardKey.goBack ||
+          e.logicalKey == LogicalKeyboardKey.escape) {
+        final now = DateTime.now();
+        final last = _lastBackPressAt;
+        if (last != null && now.difference(last) < const Duration(milliseconds: 600)) {
+          _backPressCount++;
+        } else {
+          _backPressCount = 1;
+        }
+        _lastBackPressAt = now;
+
+        if (_backPressCount >= 5 && !_isEditorOpen) {
+          _backPressCount = 0;
+          _openEditor();
+          return true;
+        }
+        // Не перехватываем — позволяем Flutter обработать Back стандартно
+        return false;
       }
     }
     return false;
   }
 
+  Future<bool> _checkPinIfRequired() async {
+    final pin = _controller.servicePin;
+    if (pin.isEmpty) return true;
+    final entered = await Get.dialog<String>(
+      const _PinDialog(),
+      barrierDismissible: false,
+    );
+    return entered == pin;
+  }
+
   // ===== ДОБАВЛЕНО: методы для работы с редактором =====
   void _openEditor() async {
+    if (!await _checkPinIfRequired()) return;
     await _pausePlayerForEditor();
     Get.to(() => const EditorScreen())?.then((_) {
       if (!_isDisposed && mounted) {
@@ -1642,6 +1686,89 @@ bool _isSameSlot(ManifestItem? a, ManifestItem b) {
       a.endTime == b.endTime &&
       a.loopMode == b.loopMode &&
       a.priority == b.priority;
+}
+
+class _PinDialog extends StatefulWidget {
+  const _PinDialog();
+
+  @override
+  State<_PinDialog> createState() => _PinDialogState();
+}
+
+class _PinDialogState extends State<_PinDialog> {
+  final _controller = TextEditingController();
+  bool _obscure = true;
+  String? _error;
+
+  void _submit() {
+    final value = _controller.text.trim();
+    if (value.isEmpty) {
+      setState(() => _error = 'Введите PIN-код');
+      return;
+    }
+    Get.back(result: value);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.lock_outline, size: 20),
+          SizedBox(width: 8),
+          Text('Сервисный доступ'),
+        ],
+      ),
+      content: SizedBox(
+        width: 280,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Для входа в редактор введите PIN-код.',
+              style: TextStyle(color: Colors.grey),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _controller,
+              obscureText: _obscure,
+              keyboardType: TextInputType.number,
+              autofocus: true,
+              decoration: InputDecoration(
+                labelText: 'PIN-код',
+                border: const OutlineInputBorder(),
+                errorText: _error,
+                suffixIcon: IconButton(
+                  icon: Icon(_obscure ? Icons.visibility_off : Icons.visibility),
+                  onPressed: () => setState(() => _obscure = !_obscure),
+                ),
+              ),
+              onSubmitted: (_) => _submit(),
+              onChanged: (_) {
+                if (_error != null) setState(() => _error = null);
+              },
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Get.back<String>(),
+          child: const Text('Отмена'),
+        ),
+        FilledButton(
+          onPressed: _submit,
+          child: const Text('Войти'),
+        ),
+      ],
+    );
+  }
 }
 
 bool _isSameSlotIdentity(ManifestItem? a, ManifestItem b) {
