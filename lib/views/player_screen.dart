@@ -313,7 +313,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Player _createVideoPlayer() {
     return Player(
       configuration: const PlayerConfiguration(
-        title: 'Panel Client Player',
+        title: 'EFIR Player',
         osc: false,
       ),
     );

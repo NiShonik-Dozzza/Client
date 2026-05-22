@@ -3,8 +3,8 @@ set -euo pipefail
 
 ADB_BIN="${ADB_BIN:-$HOME/Android/Sdk/platform-tools/adb}"
 DEVICE_SERIAL="${1:-adb-5d52ca3f0505-GKifDP._adb-tls-connect._tcp}"
-APP_ID="${APP_ID:-com.example.panel}"
-ACTIVITY="${ACTIVITY:-com.example.panel.MainActivity}"
+APP_ID="${APP_ID:-com.efir.client}"
+ACTIVITY="${ACTIVITY:-com.efir.client.MainActivity}"
 
 if [[ ! -x "$ADB_BIN" ]]; then
   echo "adb not found: $ADB_BIN" >&2

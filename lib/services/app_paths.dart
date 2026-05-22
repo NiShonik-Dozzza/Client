@@ -3,7 +3,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 class AppPaths {
-  static const String _rootFolderName = 'panel';
+  static const String _rootFolderName = 'efir';
 
   static Future<Directory> rootDir() async {
     final docs = await getApplicationDocumentsDirectory();
