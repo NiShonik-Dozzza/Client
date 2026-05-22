@@ -44,6 +44,10 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+# Платформы не используются в проекте
+/ios/
+/macos/
+
 # Test/demo media files (not for version control)
 assets/media/*.mp4
 assets/media/*.png
