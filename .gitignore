@@ -43,3 +43,11 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Test/demo media files (not for version control)
+assets/media/*.mp4
+assets/media/*.png
+assets/media/*.jpg
+assets/media/*.jpeg
+assets/media/*.gif
+assets/media/*.webp
