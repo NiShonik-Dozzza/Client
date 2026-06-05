@@ -68,6 +68,24 @@ class PlaylistItem {
     'duration_seconds': durationSeconds,
   };
 
+  /// Sentinel for "always active, no schedule":
+  /// created with startDate = DateTime(2000,1,1) and no stopDate.
+  bool get isAlwaysActive => startDate.year < 2010 && stopDate == null;
+
+  factory PlaylistItem.alwaysActive({
+    required String filename,
+    bool loop = true,
+    int durationSeconds = 10,
+  }) {
+    return PlaylistItem(
+      filename: filename,
+      startDate: DateTime(2000, 1, 1),
+      stopDate: null,
+      loop: loop,
+      durationSeconds: durationSeconds,
+    );
+  }
+
   String get baseName => p.basename(filename);
 
   bool get isImage {

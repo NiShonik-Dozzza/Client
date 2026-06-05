@@ -1,4 +1,4 @@
-package com.example.panel
+package com.efir.client
 
 import android.os.Bundle
 import android.view.WindowManager

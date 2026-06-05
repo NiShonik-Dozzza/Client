@@ -44,7 +44,7 @@ android {
         applicationId = "com.efir.client"
 
         // media_kit требует минимум Android 6.0 (API 23).
-        minSdk = 23
+        minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

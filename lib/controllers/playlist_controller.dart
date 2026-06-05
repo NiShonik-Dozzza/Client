@@ -450,20 +450,26 @@ class PlaylistController extends GetxController {
   }
 
   List<PlaylistItem> _normalizeLocalItems(List<PlaylistItem> items) {
-    final normalized =
-        items
-            .where((item) => item.filename.trim().isNotEmpty)
-            .map(
-              (item) => item.copyWith(
-                filename: item.filename.trim(),
-                durationSeconds: item.durationSeconds < 1
-                    ? 1
-                    : item.durationSeconds,
-              ),
-            )
-            .toList()
-          ..sort((a, b) => a.startDate.compareTo(b.startDate));
-    return normalized;
+    final normalized = items
+        .where((item) => item.filename.trim().isNotEmpty)
+        .map(
+          (item) => item.copyWith(
+            filename: item.filename.trim(),
+            durationSeconds: item.durationSeconds < 1 ? 1 : item.durationSeconds,
+          ),
+        )
+        .toList();
+
+    // Стабильная сортировка по startDate: при равных датах (например, все
+    // «всегда активные» элементы с 2000-01-01) сохраняется исходный порядок.
+    // Dart List.sort не гарантирует стабильность, поэтому сортируем по паре
+    // (startDate, исходный индекс).
+    final indexed = normalized.asMap().entries.toList()
+      ..sort((a, b) {
+        final byDate = a.value.startDate.compareTo(b.value.startDate);
+        return byDate != 0 ? byDate : a.key.compareTo(b.key);
+      });
+    return indexed.map((e) => e.value).toList();
   }
 
   Future<void> refreshLocalPlaylist() async {
@@ -513,6 +519,12 @@ class PlaylistController extends GetxController {
       }
     }
     return null;
+  }
+
+  /// Все активные в момент [now] локальные элементы — в порядке списка.
+  /// Используется для последовательной ротации в оффлайн-режиме.
+  List<PlaylistItem> activeOfflineItems(DateTime now) {
+    return localItems.where((item) => item.isActiveAt(now)).toList();
   }
 
   Future<void> loadPlaylist() async {

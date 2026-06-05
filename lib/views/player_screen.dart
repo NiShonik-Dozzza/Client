@@ -615,6 +615,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     await _stopEverything();
 
+    // Сбрасываем сигнатуру оффлайн-очереди: после правок в редакторе она
+    // перестроится с нуля (resume вызывает _applySchedule(force: true)).
+    _offlineSignature = '';
+
     if (mounted) {
       setState(() {
         _mode = _Mode.black;
@@ -841,15 +845,35 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   // ===== НОВЫЙ МЕТОД: обработка оффлайн-режима =====
+  // ===== Оффлайн-ротация: очередь активных элементов =====
+  List<PlaylistItem> _offlineQueue = [];
+  int _offlineIndex = 0;
+  String _offlineSignature = '';
+  PlaylistItem? _lastOfflineItem;
+
+  /// Сигнатура набора активных элементов — чтобы перезапускать очередь только
+  /// когда состав/расписание реально изменились, а не на каждом тике.
+  String _offlineSignatureOf(List<PlaylistItem> items) {
+    return items
+        .map((e) =>
+            '${e.filename}|${e.startDate.toIso8601String()}|${e.stopDate?.toIso8601String() ?? "-"}|${e.loop}|${e.durationSeconds}')
+        .join(',');
+  }
+
   Future<void> _applyOfflineSchedule(
     DateTime now,
     PlaylistController controller,
     bool force,
   ) async {
-    final nextItem = controller.currentOfflineItem(now);
+    final active = controller.activeOfflineItems(now);
 
-    if (nextItem == null) {
-      if (_currentSlot != null || _currentMedia != null) {
+    if (active.isEmpty) {
+      if (_offlineQueue.isNotEmpty ||
+          _currentSlot != null ||
+          _currentMedia != null) {
+        _offlineQueue = [];
+        _offlineSignature = '';
+        _lastOfflineItem = null;
         await _stopEverything();
         setState(() {
           _currentSlot = null;
@@ -863,46 +887,72 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    // Проверяем, тот же ли элемент
-    final same =
-        !force &&
-        _currentSlot == null &&
-        _currentMedia == null &&
-        _lastOfflineItem != null &&
-        _lastOfflineItem!.filename == nextItem.filename &&
-        _lastOfflineItem!.startDate == nextItem.startDate &&
-        _lastOfflineItem!.stopDate == nextItem.stopDate;
+    final signature = _offlineSignatureOf(active);
 
-    if (same) return;
+    // Набор не изменился — пусть текущий элемент доигрывает.
+    if (!force && signature == _offlineSignature) {
+      return;
+    }
 
-    _lastOfflineItem = nextItem;
+    await AppLogger.log(
+      'offline schedule rebuild: force=$force count=${active.length} signature_changed=${signature != _offlineSignature}',
+    );
+    _offlineSignature = signature;
+    _offlineQueue = active;
+    await _playOfflineIndex(0);
+  }
 
-    // Останавливаем текущее воспроизведение
-    await _stopEverything();
+  /// Воспроизводит элемент очереди по индексу (с заворачиванием по кругу).
+  Future<void> _playOfflineIndex(int index) async {
+    if (_isDisposed || _isEditorOpen || _offlineQueue.isEmpty) return;
+    _offlineIndex = index % _offlineQueue.length;
+    final item = _offlineQueue[_offlineIndex];
+    _lastOfflineItem = item;
 
-    // Сбрасываем таймеры серверного режима
     _slotTimer?.cancel();
     _imageTimer?.cancel();
 
-    // Ставим таймер на окончание элемента
-    if (nextItem.stopDate != null) {
-      final dur = nextItem.stopDate!.difference(now);
-      if (!dur.isNegative) {
-        _slotTimer = Timer(dur, () => _applySchedule(force: true));
-      }
-    }
-
-    // Воспроизводим элемент
-    await _playOfflineItem(nextItem);
+    await AppLogger.log(
+      'offline play index: $_offlineIndex/${_offlineQueue.length - 1} file=${item.filename} loop=${item.loop}',
+    );
+    await _playOfflineItem(item);
   }
 
-  PlaylistItem? _lastOfflineItem;
+  /// Переход к следующему элементу очереди. Перед переходом пере-вычисляет
+  /// активный набор — истёкшие элементы выпадают, новые подхватываются.
+  Future<void> _advanceOffline() async {
+    if (_isDisposed || _isEditorOpen) return;
+    final controller = Get.find<PlaylistController>();
+    final active = controller.activeOfflineItems(DateTime.now());
+    final signature = _offlineSignatureOf(active);
+
+    if (signature != _offlineSignature) {
+      _offlineSignature = signature;
+      _offlineQueue = active;
+      if (active.isEmpty) {
+        _lastOfflineItem = null;
+        await _stopEverything();
+        setState(() => _mode = _Mode.black);
+        return;
+      }
+      await _playOfflineIndex(0);
+      return;
+    }
+
+    if (_offlineQueue.isEmpty) return;
+    await _playOfflineIndex(_offlineIndex + 1);
+  }
 
   Future<void> _playOfflineItem(PlaylistItem item) async {
     final controller = Get.find<PlaylistController>(); // ← ДОБАВЛЕНО
 
     final cfg = await ConfigService().load();
     final mediaRoot = cfg.mediaRoot;
+
+    // В очереди из нескольких файлов каждый элемент проигрывается один раз,
+    // затем — переход к следующему (очередь крутится по кругу). Одиночный
+    // зацикленный элемент играет бесконечно.
+    final isMulti = _offlineQueue.length > 1;
 
     if (item.isImage) {
       await _stopEverything();
@@ -913,8 +963,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _imagePath = diskPath ?? 'assets/media/${item.filename}';
       });
 
-      // Если не зациклено, ставим таймер на длительность показа
-      if (!item.loop) {
+      // Картинку ограничиваем по времени, если: несколько файлов в очереди,
+      // либо элемент не зациклен. Иначе (одна зацикленная картинка) — навсегда.
+      if (isMulti || !item.loop) {
         final now = DateTime.now();
         final left = item.stopDate?.difference(now);
         final showFor = Duration(seconds: item.durationSeconds);
@@ -924,12 +975,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
         _imageTimer = Timer(dur, () {
           if (_isDisposed || !controller.isOfflineMode.value) return;
-          setState(() => _mode = _Mode.black);
+          if (_offlineQueue.length > 1) {
+            unawaited(_advanceOffline());
+          } else {
+            setState(() => _mode = _Mode.black);
+          }
         });
       }
 
       await AppLogger.log(
-        'OFFLINE: SHOW IMAGE: ${item.filename} (loop=${item.loop})',
+        'OFFLINE: SHOW IMAGE: ${item.filename} (loop=${item.loop} multi=$isMulti)',
       );
       return;
     }
@@ -938,11 +993,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final diskPath = await _getLocalMediaPath(mediaRoot, item.filename);
       final src = diskPath ?? 'asset:///assets/media/${item.filename}';
 
+      // Зацикливаем на уровне плеера только одиночное видео. В очереди из
+      // нескольких — видео доигрывает и отдаёт управление для перехода дальше.
+      final loopSingle = !isMulti && item.loop;
+
       try {
-        await _playVideoSource(src, loopSingle: item.loop);
+        await _playVideoSource(src, loopSingle: loopSingle);
 
         await AppLogger.log(
-          'OFFLINE: PLAY VIDEO: ${item.filename} src=$src (loop=${item.loop})',
+          'OFFLINE: PLAY VIDEO: ${item.filename} src=$src (loop=$loopSingle multi=$isMulti)',
         );
       } catch (e) {
         _expectVideoCompleted = false;
@@ -999,10 +1058,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _waitForVideoWarmup(int playerIndex) async {
+    bool timedOut = false;
     final hasFrame = Stream<void>.periodic(
       const Duration(milliseconds: 50),
     ).firstWhere((_) => _playerHasRenderableFrame(playerIndex));
-    await hasFrame.timeout(_videoPrepareWarmupTimeout, onTimeout: () {});
+    await hasFrame.timeout(_videoPrepareWarmupTimeout, onTimeout: () {
+      timedOut = true;
+    });
+    if (timedOut) {
+      unawaited(AppLogger.log(
+        'video warmup timeout: player=$playerIndex timeout=${_videoPrepareWarmupTimeout.inMilliseconds}ms size=${_playerSizeLabel(playerIndex)} pos=${_formatTc(_playerPositions[playerIndex])} buf=${_playerBuffers[playerIndex].inMilliseconds}ms buffering=${_playerBuffering[playerIndex]}',
+      ));
+    }
     await Future<void>.delayed(const Duration(milliseconds: 80));
   }
 
@@ -1332,16 +1399,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     // В оффлайн-режиме обрабатываем по-другому
     if (controller.isOfflineMode.value) {
+      // Несколько файлов в очереди — переходим к следующему по кругу.
+      if (_offlineQueue.length > 1) {
+        await _advanceOffline();
+        return;
+      }
+
       final item = _lastOfflineItem;
       if (item == null) return;
 
-      // Если не зациклен - чёрный экран
+      // Одиночный незациклённый элемент — чёрный экран.
       if (!item.loop) {
         setState(() => _mode = _Mode.black);
         return;
       }
 
-      // Если зациклен и ещё в пределах времени - перезапускаем
+      // Одиночный зациклённый и ещё в пределах времени - перезапускаем.
       final now = DateTime.now();
       final stillInWindow = item.stopDate == null
           ? true
@@ -1616,6 +1689,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
 
           // ============================================================
+          // Buffering indicator - small spinner in bottom-right when video is buffering
+          if (_mode == _Mode.video && _playerBuffering[_activeVideoIndex])
+            Positioned(
+              right: 16,
+              bottom: 16,
+              child: Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.45),
+                  shape: BoxShape.circle,
+                ),
+                padding: const EdgeInsets.all(10),
+                child: const CircularProgressIndicator(
+                  color: Colors.white,
+                  strokeWidth: 2.5,
+                ),
+              ),
+            ),
           if (_debug)
             Positioned(
               left: 12,

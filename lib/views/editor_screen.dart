@@ -17,13 +17,11 @@ class EditorScreen extends StatefulWidget {
 }
 
 class _EditorScreenState extends State<EditorScreen> {
-  final _formKey = GlobalKey<FormState>();
   late List<PlaylistItem> _items;
   bool _isLoading = true;
-  final _dateFormat = DateFormat("yyyy-MM-dd'T'HH:mm:ss");
+  bool _dirty = false;
   final _scrollController = ScrollController();
-  int? _editingIndex;
-  bool _isOfflineMode = false; // Локальное состояние для плавной анимации
+  bool _isOfflineMode = false;
   bool _modeToggleBusy = false;
   Worker? _offlineModeWorker;
   Timer? _statusTimer;
@@ -31,14 +29,7 @@ class _EditorScreenState extends State<EditorScreen> {
   Color _statusColor = Colors.blue.shade700;
   IconData _statusIcon = Icons.info_outline;
   bool _serverBusy = false;
-
-  // Поля для нового элемента
-  final _filenameCtrl = TextEditingController();
   final _serverCtrl = TextEditingController();
-  DateTime _startDate = DateTime.now();
-  DateTime? _stopDate;
-  bool _loop = true;
-  int _durationSeconds = 10;
 
   late final PlaylistController _controller;
 
@@ -48,7 +39,6 @@ class _EditorScreenState extends State<EditorScreen> {
     _controller = Get.find<PlaylistController>();
     _serverCtrl.text = _controller.serverAddress;
 
-    // Следим за изменением режима в контроллере
     _offlineModeWorker = ever<bool>(_controller.isOfflineMode, (mode) {
       setState(() {
         _isOfflineMode = mode;
@@ -65,7 +55,6 @@ class _EditorScreenState extends State<EditorScreen> {
     _offlineModeWorker?.dispose();
     _statusTimer?.cancel();
     _scrollController.dispose();
-    _filenameCtrl.dispose();
     _serverCtrl.dispose();
     super.dispose();
   }
@@ -79,6 +68,7 @@ class _EditorScreenState extends State<EditorScreen> {
     setState(() {
       _items = items;
       _isLoading = false;
+      _dirty = false;
     });
   }
 
@@ -104,7 +94,7 @@ class _EditorScreenState extends State<EditorScreen> {
         );
       }
     } catch (e) {
-      await AppLogger.log('Offline mode toggle error: $e');
+      unawaited(AppLogger.log('Offline mode toggle error: $e'));
       _showStatus(
         'Не удалось переключить режим: $e',
         color: Colors.red.shade700,
@@ -176,7 +166,7 @@ class _EditorScreenState extends State<EditorScreen> {
     }
   }
 
-  Future<void> _pickAndCopyFile() async {
+  Future<void> _pickAndAddFiles() async {
     if (!_isOfflineMode) {
       _showStatus(
         'Включите аварийный оффлайн-режим для редактирования.',
@@ -188,6 +178,7 @@ class _EditorScreenState extends State<EditorScreen> {
 
     final result = await FilePicker.pickFiles(
       type: FileType.custom,
+      allowMultiple: true,
       allowedExtensions: [
         'mp4',
         'mov',
@@ -204,54 +195,66 @@ class _EditorScreenState extends State<EditorScreen> {
 
     if (result == null || result.files.isEmpty) return;
 
-    try {
-      final platformFile = result.files.first;
-      final sourcePath = platformFile.path;
-      if (sourcePath == null) {
-        _showStatus(
-          'Невозможно получить путь к выбранному файлу.',
-          color: Colors.red.shade700,
-          icon: Icons.error_outline,
-        );
-        return;
+    int added = 0;
+    int skipped = 0;
+
+    for (final platformFile in result.files) {
+      try {
+        final sourcePath = platformFile.path;
+        if (sourcePath == null) {
+          skipped++;
+          continue;
+        }
+
+        final sourceFile = File(sourcePath);
+        final mediaDir = await AppPaths.mediaDir();
+        final destFile = File('${mediaDir.path}/${platformFile.name}');
+        final sourceAbsolute = sourceFile.absolute.path;
+        final destAbsolute = destFile.absolute.path;
+        final destinationExists = await destFile.exists();
+
+        if (sourceAbsolute == destAbsolute) {
+          unawaited(AppLogger.log('Using existing local media file: $destAbsolute'));
+        } else if (destinationExists) {
+          unawaited(AppLogger.log('Using existing media file without overwrite: $destAbsolute'));
+        } else {
+          await sourceFile.copy(destFile.path);
+          unawaited(AppLogger.log('File copied to media folder: ${destFile.path}'));
+        }
+
+        setState(() {
+          _items.add(PlaylistItem.alwaysActive(filename: platformFile.name));
+          _dirty = true;
+        });
+        added++;
+      } catch (e) {
+        unawaited(AppLogger.log('File copy error (${platformFile.name}): $e'));
+        skipped++;
       }
+    }
 
-      final sourceFile = File(sourcePath);
-      final mediaDir = await AppPaths.mediaDir();
-      final destFile = File('${mediaDir.path}/${platformFile.name}');
-      final sourceAbsolute = sourceFile.absolute.path;
-      final destAbsolute = destFile.absolute.path;
-      final destinationExists = await destFile.exists();
-      final usedExistingFile =
-          sourceAbsolute == destAbsolute || destinationExists;
+    if (added > 0) {
+      await _persist();
+    }
 
-      if (sourceAbsolute == destAbsolute) {
-        await AppLogger.log('Using existing local media file: $destAbsolute');
-      } else if (destinationExists) {
-        await AppLogger.log(
-          'Using existing media file without overwrite: $destAbsolute',
-        );
-      } else {
-        await sourceFile.copy(destFile.path);
-        await AppLogger.log('File copied to media folder: ${destFile.path}');
-      }
-
-      // Автозаполнение имени файла
-      setState(() {
-        _filenameCtrl.text = platformFile.name;
-      });
-
+    if (added > 0 && skipped == 0) {
       _showStatus(
-        usedExistingFile
-            ? 'Файл уже есть в локальной медиапапке. Можно сразу добавлять элемент в плейлист.'
-            : 'Файл скопирован в локальную медиапапку.',
+        added == 1
+            ? 'Файл добавлен и сохранён.'
+            : '$added файлов добавлено и сохранено.',
         color: Colors.green.shade700,
         icon: Icons.check_circle_outline,
       );
-    } catch (e) {
-      await AppLogger.log('File copy error: $e');
+    } else if (added > 0) {
       _showStatus(
-        'Не удалось скопировать файл: $e',
+        '$added добавлено, $skipped не удалось скопировать.',
+        color: Colors.orange.shade700,
+        icon: Icons.warning_amber_rounded,
+        duration: const Duration(seconds: 5),
+      );
+    } else {
+      _showStatus(
+        'Не удалось скопировать ни один файл.',
         color: Colors.red.shade700,
         icon: Icons.error_outline,
         duration: const Duration(seconds: 5),
@@ -280,76 +283,6 @@ class _EditorScreenState extends State<EditorScreen> {
         false;
   }
 
-  void _openItemForEdit(int index) {
-    if (!_isOfflineMode) {
-      _showStatus(
-        'Редактирование доступно только в аварийном оффлайн-режиме.',
-        color: Colors.orange.shade700,
-        icon: Icons.lock_outline,
-      );
-      return;
-    }
-
-    final item = _items[index];
-    setState(() {
-      _editingIndex = index;
-      _filenameCtrl.text = item.filename;
-      _startDate = item.startDate;
-      _stopDate = item.stopDate;
-      _loop = item.loop;
-      _durationSeconds = item.durationSeconds;
-    });
-    _scrollController.animateTo(
-      _scrollController.position.maxScrollExtent,
-      duration: const Duration(milliseconds: 300),
-      curve: Curves.easeInOut,
-    );
-  }
-
-  void _saveItem() {
-    if (!_isOfflineMode) {
-      _showStatus(
-        'Сначала включите аварийный оффлайн-режим.',
-        color: Colors.orange.shade700,
-        icon: Icons.lock_outline,
-      );
-      return;
-    }
-
-    if (!_formKey.currentState!.validate()) return;
-
-    final wasEditing = _editingIndex != null;
-    final newItem = PlaylistItem(
-      filename: _filenameCtrl.text.trim(),
-      startDate: _startDate,
-      stopDate: _stopDate,
-      loop: _loop,
-      durationSeconds: _durationSeconds,
-    );
-
-    setState(() {
-      if (wasEditing) {
-        _items[_editingIndex!] = newItem;
-        _editingIndex = null;
-      } else {
-        _items.add(newItem);
-      }
-      _filenameCtrl.clear();
-      _startDate = DateTime.now();
-      _stopDate = null;
-      _loop = true;
-      _durationSeconds = 10;
-    });
-
-    _showStatus(
-      wasEditing
-          ? 'Элемент обновлён в локальном списке.'
-          : 'Элемент добавлен в локальный список.',
-      color: Colors.green.shade700,
-      icon: Icons.check_circle_outline,
-    );
-  }
-
   void _deleteItem(int index) async {
     if (!_isOfflineMode) {
       _showStatus(
@@ -362,17 +295,71 @@ class _EditorScreenState extends State<EditorScreen> {
 
     final confirm = await _showConfirmDialog(
       'Удалить элемент?',
-      'Вы уверены, что хотите удалить ${_items[index].filename}?',
+      'Вы уверены, что хотите удалить ${_items[index].baseName}?',
     );
 
     if (confirm) {
       setState(() {
         _items.removeAt(index);
+        _dirty = true;
       });
+      await _persist();
       _showStatus(
-        'Элемент удалён из локального списка.',
+        'Элемент удалён.',
         color: Colors.green.shade700,
         icon: Icons.delete_outline,
+      );
+    }
+  }
+
+  Future<void> _openEditDialog(int index) async {
+    if (!_isOfflineMode) {
+      _showStatus(
+        'Редактирование доступно только в аварийном оффлайн-режиме.',
+        color: Colors.orange.shade700,
+        icon: Icons.lock_outline,
+      );
+      return;
+    }
+
+    final result = await Get.dialog<PlaylistItem>(
+      _ItemEditDialog(item: _items[index]),
+      barrierDismissible: false,
+    );
+
+    if (result != null) {
+      setState(() {
+        _items[index] = result;
+        _dirty = true;
+      });
+      await _persist();
+      _showStatus(
+        'Элемент обновлён.',
+        color: Colors.green.shade700,
+        icon: Icons.check_circle_outline,
+      );
+    }
+  }
+
+  /// Тихое автосохранение после любого изменения — чтобы добавленные файлы
+  /// не терялись при выходе из редактора кнопкой «назад».
+  /// После сохранения пере-считываем список из контроллера, чтобы порядок
+  /// в редакторе совпадал с порядком воспроизведения (нормализация + сортировка).
+  Future<void> _persist() async {
+    try {
+      await _controller.saveLocalPlaylist(_items);
+      if (!mounted) return;
+      setState(() {
+        _items = List<PlaylistItem>.from(_controller.editorItems);
+        _dirty = false;
+      });
+    } catch (e) {
+      unawaited(AppLogger.log('Auto-save error: $e'));
+      _showStatus(
+        'Не удалось сохранить изменения: $e',
+        color: Colors.red.shade700,
+        icon: Icons.error_outline,
+        duration: const Duration(seconds: 5),
       );
     }
   }
@@ -390,9 +377,10 @@ class _EditorScreenState extends State<EditorScreen> {
     try {
       await _controller.saveLocalPlaylist(_items);
 
-      await AppLogger.log(
+      unawaited(AppLogger.log(
         'Playlist saved to: ${await AppPaths.playlistFile()}',
-      );
+      ));
+      setState(() => _dirty = false);
       _showStatus(
         'Аварийный плейлист сохранён. Возвращаемся к воспроизведению.',
         color: Colors.green.shade700,
@@ -404,7 +392,7 @@ class _EditorScreenState extends State<EditorScreen> {
         if (mounted) Get.back();
       });
     } catch (e) {
-      await AppLogger.log('Save playlist error: $e');
+      unawaited(AppLogger.log('Save playlist error: $e'));
       _showStatus(
         'Не удалось сохранить плейлист: $e',
         color: Colors.red.shade700,
@@ -417,18 +405,20 @@ class _EditorScreenState extends State<EditorScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFFF5F5F5),
       appBar: AppBar(
-        title: const Text('Редактор плейлиста'),
-        backgroundColor: Colors.blue.shade800,
+        backgroundColor: Colors.white,
+        elevation: 0,
+        title: const Text('Резервный плейлист'),
         actions: [
-          if (_isOfflineMode)
+          if (_isOfflineMode && _dirty)
             IconButton(
-              icon: const Icon(Icons.save, color: Colors.white),
+              icon: Icon(Icons.save, color: Colors.green.shade700),
               onPressed: _savePlaylist,
-              tooltip: 'Сохранить плейлист (Ctrl+S)',
+              tooltip: 'Сохранить плейлист',
             ),
           IconButton(
-            icon: const Icon(Icons.refresh, color: Colors.white),
+            icon: const Icon(Icons.refresh),
             onPressed: _loadPlaylist,
             tooltip: 'Перезагрузить',
           ),
@@ -436,173 +426,9 @@ class _EditorScreenState extends State<EditorScreen> {
       ),
       body: Column(
         children: [
-          if (_statusMessage != null)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              color: _statusColor.withValues(alpha: 0.12),
-              child: Row(
-                children: [
-                  Icon(_statusIcon, color: _statusColor),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      _statusMessage!,
-                      style: TextStyle(
-                        color: _statusColor,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: () => setState(() => _statusMessage = null),
-                    icon: Icon(Icons.close, color: _statusColor),
-                    tooltip: 'Закрыть сообщение',
-                  ),
-                ],
-              ),
-            ),
-          // Переключатель режима
-          Container(
-            color: Colors.grey[200],
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Wrap(
-              spacing: 12,
-              runSpacing: 8,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                const Text(
-                  'Онлайн-режим',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                Obx(
-                  () => Switch(
-                    value: _controller.isOfflineMode.value,
-                    onChanged: _modeToggleBusy
-                        ? null
-                        : (value) {
-                            // Подтверждение при включении оффлайн-режима
-                            if (value) {
-                              Get.dialog(
-                                AlertDialog(
-                                  title: const Text('Аварийный оффлайн-режим'),
-                                  content: const Text(
-                                    'В этом режиме:\n• Панель работает без сервера\n• Все изменения сохраняются локально\n• После отключения режима данные НЕ синхронизируются с сервером\n\nВключить аварийный режим?',
-                                  ),
-                                  actions: [
-                                    TextButton(
-                                      onPressed: Get.back,
-                                      child: const Text('Отмена'),
-                                    ),
-                                    TextButton(
-                                      onPressed: () async {
-                                        Get.back();
-                                        await _toggleOfflineMode(true);
-                                      },
-                                      child: const Text(
-                                        'Включить',
-                                        style: TextStyle(color: Colors.red),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              );
-                            } else {
-                              // Подтверждение при отключении оффлайн-режима
-                              Get.dialog(
-                                AlertDialog(
-                                  title: const Text(
-                                    'Вернуться в онлайн-режим?',
-                                  ),
-                                  content: const Text(
-                                    'Все несохранённые изменения в локальном плейлисте будут потеряны!\nСерверный манифест будет загружен автоматически.',
-                                  ),
-                                  actions: [
-                                    TextButton(
-                                      onPressed: Get.back,
-                                      child: const Text('Отмена'),
-                                    ),
-                                    TextButton(
-                                      onPressed: () async {
-                                        Get.back();
-                                        await _toggleOfflineMode(false);
-                                      },
-                                      child: const Text(
-                                        'Подтвердить',
-                                        style: TextStyle(color: Colors.green),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              );
-                            }
-                          },
-                    activeThumbColor: Colors.red,
-                    activeTrackColor: Colors.red.shade200,
-                    inactiveThumbColor: Colors.green,
-                    inactiveTrackColor: Colors.green.shade200,
-                  ),
-                ),
-                const Text(
-                  'Оффлайн-режим (аварийный)',
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    color: Colors.red,
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          Container(
-            color: Colors.white,
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Сервер устройства',
-                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _serverCtrl,
-                        enabled: !_serverBusy,
-                        decoration: const InputDecoration(
-                          labelText: 'Адрес сервера',
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    FilledButton.icon(
-                      onPressed: _serverBusy ? null : _changeServerOnline,
-                      icon: _serverBusy
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.sync_alt),
-                      label: const Text('Сменить'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'После смены сервера устройство заново проходит регистрацию на новом контуре.',
-                  style: TextStyle(color: Colors.grey.shade700, fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-
-          const Divider(height: 1),
-
-          // Основной контент
+          _buildModeBar(),
+          _buildServerSection(),
+          if (_statusMessage != null) _buildStatusBanner(),
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator())
@@ -610,457 +436,641 @@ class _EditorScreenState extends State<EditorScreen> {
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () {
-          Get.dialog(
-            AlertDialog(
-              title: const Text('Инструкция'),
-              content: SingleChildScrollView(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text('🔹 Онлайн-режим (по умолчанию):'),
-                    const Text('   • Данные приходят с сервера'),
-                    const Text('   • Редактирование недоступно'),
-                    const SizedBox(height: 12),
-                    const Text('🔸 Оффлайн-режим (аварийный):'),
-                    const Text('   • Работает без интернета/сервера'),
-                    const Text('   • Полное редактирование плейлиста'),
-                    const Text('   • Медиафайлы должны быть в папке media'),
-                    const SizedBox(height: 12),
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.red.shade50,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Text(
-                        '❗ Внимание: при выходе из оффлайн-режима локальные изменения НЕ сохранятся на сервер!',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          color: Colors.red,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(onPressed: Get.back, child: const Text('Понятно')),
-              ],
+      floatingActionButton: _isOfflineMode
+          ? FloatingActionButton.extended(
+              icon: const Icon(Icons.add),
+              label: const Text('Добавить файлы'),
+              onPressed: _pickAndAddFiles,
+            )
+          : null,
+    );
+  }
+
+  Widget _buildModeBar() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      color: _isOfflineMode ? Colors.orange.shade50 : Colors.green.shade50,
+      child: Row(
+        children: [
+          Icon(
+            _isOfflineMode ? Icons.wifi_off : Icons.cloud_done,
+            color: _isOfflineMode ? Colors.orange.shade800 : Colors.green.shade800,
+          ),
+          const SizedBox(width: 8),
+          Text(
+            _isOfflineMode ? 'Аварийный оффлайн-режим' : 'Онлайн-режим',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: _isOfflineMode ? Colors.orange.shade800 : Colors.green.shade800,
             ),
-          );
-        },
-        icon: const Icon(Icons.help_outline),
-        label: const Text('Помощь'),
+          ),
+          const Spacer(),
+          if (_modeToggleBusy)
+            const SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          else
+            Switch(
+              value: _isOfflineMode,
+              activeThumbColor: Colors.orange,
+              activeTrackColor: Colors.orange.shade200,
+              onChanged: (v) {
+                if (v) {
+                  Get.dialog(
+                    AlertDialog(
+                      title: const Text('Аварийный оффлайн-режим'),
+                      content: const Text(
+                        'В этом режиме:\n• Панель работает без сервера\n• Все изменения сохраняются локально\n• После отключения режима данные НЕ синхронизируются с сервером\n\nВключить аварийный режим?',
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: Get.back,
+                          child: const Text('Отмена'),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            Get.back();
+                            await _toggleOfflineMode(true);
+                          },
+                          child: const Text(
+                            'Включить',
+                            style: TextStyle(color: Colors.red),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                } else {
+                  Get.dialog(
+                    AlertDialog(
+                      title: const Text('Вернуться в онлайн-режим?'),
+                      content: const Text(
+                        'Все несохранённые изменения в локальном плейлисте будут потеряны!\nСерверный манифест будет загружен автоматически.',
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: Get.back,
+                          child: const Text('Отмена'),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            Get.back();
+                            await _toggleOfflineMode(false);
+                          },
+                          child: const Text(
+                            'Подтвердить',
+                            style: TextStyle(color: Colors.green),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildServerSection() {
+    return Container(
+      color: Colors.white,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _serverCtrl,
+              enabled: !_serverBusy,
+              decoration: const InputDecoration(
+                labelText: 'Адрес сервера',
+                border: OutlineInputBorder(),
+                isDense: true,
+                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          SizedBox(
+            height: 44,
+            child: FilledButton.icon(
+              onPressed: _serverBusy ? null : _changeServerOnline,
+              icon: _serverBusy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.sync_alt),
+              label: const Text('Сменить'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusBanner() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      color: _statusColor.withValues(alpha: 0.12),
+      child: Row(
+        children: [
+          Icon(_statusIcon, color: _statusColor),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              _statusMessage!,
+              style: TextStyle(
+                color: _statusColor,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          IconButton(
+            onPressed: () => setState(() => _statusMessage = null),
+            icon: Icon(Icons.close, color: _statusColor),
+            tooltip: 'Закрыть',
+          ),
+        ],
       ),
     );
   }
 
   Widget _buildContent() {
     if (!_isOfflineMode) {
+      return _buildOnlineModeView();
+    }
+    return _buildOfflineModeList();
+  }
+
+  Widget _buildOnlineModeView() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.cloud, size: 72, color: Colors.blue.shade200),
+          const SizedBox(height: 16),
+          const Text(
+            'Управление через сервер',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Ревизия: ${_controller.manifest?.revision ?? '—'}',
+            style: TextStyle(color: Colors.grey.shade600, fontSize: 15),
+          ),
+          const SizedBox(height: 24),
+          if (_items.isNotEmpty) ...[
+            Text(
+              'Текущие элементы (только просмотр):',
+              style: TextStyle(
+                color: Colors.grey.shade600,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 200,
+              child: ListView.builder(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                itemCount: _items.length,
+                itemBuilder: (context, i) {
+                  final item = _items[i];
+                  return Opacity(
+                    opacity: 0.55,
+                    child: Card(
+                      elevation: 0,
+                      margin: const EdgeInsets.symmetric(vertical: 3),
+                      child: ListTile(
+                        dense: true,
+                        leading: Icon(
+                          item.isVideo ? Icons.movie_outlined : Icons.image_outlined,
+                          size: 20,
+                          color: Colors.grey,
+                        ),
+                        title: Text(
+                          item.baseName,
+                          style: const TextStyle(fontSize: 13),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOfflineModeList() {
+    if (_items.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.cloud, size: 64, color: Colors.blue),
+            const Icon(Icons.playlist_add, size: 72, color: Colors.grey),
             const SizedBox(height: 16),
             const Text(
-              'Онлайн-режим (только просмотр)',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              'Плейлист пуст',
+              style: TextStyle(fontSize: 20, color: Colors.grey),
             ),
             const SizedBox(height: 8),
             Text(
-              'Текущий режим: ${_controller.manifest?.revision ?? "не загружен"}',
-              style: const TextStyle(color: Colors.grey),
-            ),
-            const SizedBox(height: 24),
-            ElevatedButton.icon(
-              onPressed: () {
-                Get.dialog(
-                  AlertDialog(
-                    title: const Text('Информация'),
-                    content: const Text(
-                      'Для редактирования плейлиста:\n1. Переключитесь в оффлайн-режим (слайдер вверху)\n2. Добавьте/отредактируйте элементы\n3. Сохраните изменения\n4. После восстановления сервера — отключите оффлайн-режим',
-                    ),
-                    actions: [
-                      TextButton(onPressed: Get.back, child: const Text('OK')),
-                    ],
-                  ),
-                );
-              },
-              icon: const Icon(Icons.info),
-              label: const Text('Как редактировать?'),
+              'Нажмите «Добавить файлы» чтобы начать',
+              style: TextStyle(color: Colors.grey.shade500),
             ),
           ],
         ),
       );
     }
 
-    // Оффлайн-режим: обычный список элементов
-    return Column(
-      children: [
-        Expanded(
-          child: _items.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Icon(
-                        Icons.playlist_add,
-                        size: 64,
-                        color: Colors.grey,
-                      ),
-                      const SizedBox(height: 16),
-                      const Text(
-                        'Плейлист пуст',
-                        style: TextStyle(fontSize: 18, color: Colors.grey),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Добавьте первый элемент ниже',
-                        style: TextStyle(color: Colors.grey[600]),
-                      ),
-                    ],
-                  ),
-                )
-              : ListView.builder(
-                  controller: _scrollController,
-                  padding: const EdgeInsets.all(8),
-                  itemCount: _items.length,
-                  itemBuilder: (context, index) {
-                    final item = _items[index];
-                    final now = DateTime.now();
-                    final isActive =
-                        now.isAfter(item.startDate) &&
-                        (item.stopDate == null || now.isBefore(item.stopDate!));
-
-                    return Card(
-                      margin: const EdgeInsets.only(bottom: 8),
-                      color: isActive ? Colors.green.shade50 : null,
-                      elevation: 4,
-                      child: ListTile(
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 8,
-                        ),
-                        title: Text(
-                          item.filename,
-                          style: const TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                        subtitle: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Начало: ${_dateFormat.format(item.startDate)}',
-                            ),
-                            if (item.stopDate != null)
-                              Text(
-                                'Окончание: ${_dateFormat.format(item.stopDate!)}',
-                              ),
-                            Text(
-                              'Тип: ${item.isVideo
-                                  ? "Видео"
-                                  : item.isImage
-                                  ? "Изображение"
-                                  : "Неизвестно"} | Loop: ${item.loop ? "Да" : "Нет"}',
-                            ),
-                          ],
-                        ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              icon: const Icon(Icons.edit, color: Colors.blue),
-                              onPressed: () => _openItemForEdit(index),
-                              tooltip: 'Редактировать',
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.delete, color: Colors.red),
-                              onPressed: () => _deleteItem(index),
-                              tooltip: 'Удалить',
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-        // Форма редактирования (только в оффлайн-режиме)
-        if (_isOfflineMode)
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.grey[100],
-              border: Border(top: BorderSide(color: Colors.grey[300]!)),
+    final now = DateTime.now();
+    return ListView.builder(
+      controller: _scrollController,
+      padding: const EdgeInsets.only(top: 8, bottom: 88),
+      itemCount: _items.length,
+      itemBuilder: (context, index) {
+        final item = _items[index];
+        return Card(
+          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          elevation: 1,
+          child: ListTile(
+            contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            leading: CircleAvatar(
+              backgroundColor:
+                  item.isVideo ? Colors.blue.shade50 : Colors.purple.shade50,
+              child: Icon(
+                item.isVideo ? Icons.movie_outlined : Icons.image_outlined,
+                color: item.isVideo ? Colors.blue.shade700 : Colors.purple.shade700,
+              ),
             ),
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final compact = constraints.maxWidth < 720;
-                final spacing = compact ? 12.0 : 16.0;
+            title: Text(
+              item.baseName,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+              overflow: TextOverflow.ellipsis,
+            ),
+            subtitle: _buildItemSubtitle(item, now),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (item.isActiveAt(now))
+                  const Icon(Icons.circle, color: Colors.green, size: 10),
+                const SizedBox(width: 4),
+                IconButton(
+                  icon: const Icon(Icons.edit_outlined),
+                  onPressed: () => _openEditDialog(index),
+                  tooltip: 'Редактировать',
+                ),
+                IconButton(
+                  icon: Icon(Icons.delete_outline, color: Colors.red.shade400),
+                  onPressed: () => _deleteItem(index),
+                  tooltip: 'Удалить',
+                ),
+              ],
+            ),
+            onTap: () => _openEditDialog(index),
+          ),
+        );
+      },
+    );
+  }
 
-                return Form(
-                  key: _formKey,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      compact
-                          ? Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                _buildFilenameField(),
-                                SizedBox(height: spacing),
-                                _buildPickFileButton(fullWidth: true),
-                              ],
-                            )
-                          : Row(
-                              children: [
-                                Expanded(child: _buildFilenameField()),
-                                SizedBox(width: spacing),
-                                _buildPickFileButton(),
-                              ],
-                            ),
-                      SizedBox(height: spacing),
-                      compact
-                          ? Column(
-                              children: [
-                                _buildDateTimeField(
-                                  label: 'Начало*',
-                                  initialDate: _startDate,
-                                  onSelected: (dt) {
-                                    if (dt != null) {
-                                      setState(() => _startDate = dt);
-                                    }
-                                  },
-                                ),
-                                SizedBox(height: spacing),
-                                _buildDateTimeField(
-                                  label: 'Окончание',
-                                  initialDate: _stopDate,
-                                  onSelected: (dt) =>
-                                      setState(() => _stopDate = dt),
-                                  isOptional: true,
-                                ),
-                              ],
-                            )
-                          : Row(
-                              children: [
-                                Expanded(
-                                  child: _buildDateTimeField(
-                                    label: 'Начало*',
-                                    initialDate: _startDate,
-                                    onSelected: (dt) {
-                                      if (dt != null) {
-                                        setState(() => _startDate = dt);
-                                      }
-                                    },
-                                  ),
-                                ),
-                                SizedBox(width: spacing),
-                                Expanded(
-                                  child: _buildDateTimeField(
-                                    label: 'Окончание',
-                                    initialDate: _stopDate,
-                                    onSelected: (dt) =>
-                                        setState(() => _stopDate = dt),
-                                    isOptional: true,
-                                  ),
-                                ),
-                              ],
-                            ),
-                      SizedBox(height: spacing),
-                      compact
-                          ? Column(
-                              children: [
-                                _buildDurationField(),
-                                SizedBox(height: spacing),
-                                _buildLoopField(),
-                              ],
-                            )
-                          : Row(
-                              children: [
-                                Expanded(child: _buildDurationField()),
-                                SizedBox(width: spacing),
-                                Expanded(child: _buildLoopField()),
-                              ],
-                            ),
-                      SizedBox(height: spacing),
-                      compact
-                          ? Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                _buildUpdateButton(),
-                                SizedBox(height: spacing),
-                                _buildAddButton(),
-                              ],
-                            )
-                          : Row(
-                              children: [
-                                Expanded(child: _buildUpdateButton()),
-                                SizedBox(width: 12),
-                                Expanded(child: _buildAddButton()),
-                              ],
-                            ),
-                    ],
-                  ),
-                );
-              },
+  Widget _buildItemSubtitle(PlaylistItem item, DateTime now) {
+    final dateFormat = DateFormat('dd.MM.yyyy');
+
+    if (item.isAlwaysActive) {
+      return Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(
+              color: Colors.blue.shade50,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.blue.shade200),
+            ),
+            child: Text(
+              'Всегда активен',
+              style: TextStyle(
+                color: Colors.blue.shade700,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
             ),
           ),
+        ],
+      );
+    }
+
+    if (now.isBefore(item.startDate)) {
+      return Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(
+              color: Colors.grey.shade100,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.grey.shade300),
+            ),
+            child: Text(
+              'Начало ${dateFormat.format(item.startDate)}',
+              style: TextStyle(
+                color: Colors.grey.shade700,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (item.stopDate != null && !now.isBefore(item.stopDate!)) {
+      return Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(
+              color: Colors.red.shade50,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.red.shade200),
+            ),
+            child: Text(
+              'Завершён',
+              style: TextStyle(
+                color: Colors.red.shade700,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    // Active now with a stop date
+    return Row(
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+          decoration: BoxDecoration(
+            color: Colors.green.shade50,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.green.shade200),
+          ),
+          child: Text(
+            item.stopDate != null
+                ? 'Активен до ${dateFormat.format(item.stopDate!)}'
+                : 'Активен',
+            style: TextStyle(
+              color: Colors.green.shade700,
+              fontSize: 12,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
       ],
     );
   }
+}
 
-  Widget _buildDateTimeField({
-    required String label,
-    required DateTime? initialDate,
-    required Function(DateTime?) onSelected,
-    bool isOptional = false,
-  }) {
-    return InputDecorator(
-      decoration: InputDecoration(
-        labelText: isOptional ? label : '$label*',
-        border: const OutlineInputBorder(),
-        suffixIcon: initialDate != null
-            ? IconButton(
-                icon: const Icon(Icons.clear, size: 18),
-                onPressed: () => onSelected(null),
-                padding: EdgeInsets.zero,
-              )
-            : null,
+// ---------------------------------------------------------------------------
+// Edit dialog
+// ---------------------------------------------------------------------------
+
+class _ItemEditDialog extends StatefulWidget {
+  const _ItemEditDialog({required this.item});
+  final PlaylistItem item;
+
+  @override
+  State<_ItemEditDialog> createState() => _ItemEditDialogState();
+}
+
+class _ItemEditDialogState extends State<_ItemEditDialog> {
+  late bool _loop;
+  late int _durationSeconds;
+  late bool _alwaysActive;
+  late DateTime _startDate;
+  late DateTime? _stopDate;
+
+  final _durationCtrl = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _loop = widget.item.loop;
+    _durationSeconds = widget.item.durationSeconds;
+    _alwaysActive = widget.item.isAlwaysActive;
+    _startDate = widget.item.startDate;
+    _stopDate = widget.item.stopDate;
+    _durationCtrl.text = _durationSeconds.toString();
+  }
+
+  @override
+  void dispose() {
+    _durationCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<DateTime?> _selectDateTime(DateTime initialDate) async {
+    final firstDate = DateTime(2020);
+    final lastDate = DateTime(2035);
+    // Sentinel «всегда активен» (2000-01-01) и любые значения вне диапазона
+    // ломают showDatePicker (assert initialDate >= firstDate). Подставляем «сейчас».
+    var seed = initialDate;
+    if (seed.isBefore(firstDate)) seed = DateTime.now();
+    if (seed.isAfter(lastDate)) seed = lastDate;
+
+    final date = await showDatePicker(
+      context: context,
+      initialDate: seed,
+      firstDate: firstDate,
+      lastDate: lastDate,
+    );
+    if (date == null) return null;
+    if (!mounted) return null;
+
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(seed),
+    );
+    if (time == null) return null;
+
+    return DateTime(date.year, date.month, date.day, time.hour, time.minute);
+  }
+
+  void _save() {
+    final result = PlaylistItem(
+      filename: widget.item.filename,
+      startDate: _alwaysActive ? DateTime(2000, 1, 1) : _startDate,
+      stopDate: _alwaysActive ? null : _stopDate,
+      loop: _loop,
+      durationSeconds: _durationSeconds,
+    );
+    Get.back<PlaylistItem>(result: result);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dateFormat = DateFormat('dd.MM.yyyy HH:mm');
+
+    return AlertDialog(
+      title: Text(
+        widget.item.baseName,
+        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        overflow: TextOverflow.ellipsis,
       ),
-      child: InkWell(
-        onTap: () async {
-          final newDate = await _selectDateTime(
-            context,
-            initialDate ?? DateTime.now(),
-          );
-          if (newDate != null) {
-            onSelected(newDate);
-          }
-        },
+      content: SizedBox(
+        width: 360,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Loop toggle
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Зациклить'),
+                value: _loop,
+                onChanged: (v) => setState(() => _loop = v),
+              ),
+
+              // Duration field (for images)
+              if (widget.item.isImage) ...[
+                const SizedBox(height: 4),
+                TextField(
+                  controller: _durationCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Длительность показа (сек)',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  onChanged: (v) =>
+                      setState(() => _durationSeconds = int.tryParse(v) ?? 10),
+                ),
+              ],
+
+              const SizedBox(height: 8),
+              const Divider(),
+              const SizedBox(height: 4),
+
+              // Always active toggle
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Всегда активен'),
+                subtitle: const Text('Без расписания, воспроизводится всегда'),
+                value: _alwaysActive,
+                onChanged: (v) => setState(() {
+                  _alwaysActive = v;
+                  // При выключении заменяем sentinel-дату (2000-01-01) на «сейчас»,
+                  // чтобы поля и пикер показывали корректное значение.
+                  if (!v && _startDate.year < 2010) {
+                    _startDate = DateTime.now();
+                  }
+                }),
+              ),
+
+              // Date fields (only when not always active)
+              if (!_alwaysActive) ...[
+                const SizedBox(height: 8),
+                _DatePickerTile(
+                  label: 'Начало',
+                  value: _startDate,
+                  dateFormat: dateFormat,
+                  onTap: () async {
+                    final dt = await _selectDateTime(_startDate);
+                    if (dt != null) setState(() => _startDate = dt);
+                  },
+                  onClear: null, // start date is required
+                ),
+                const SizedBox(height: 8),
+                _DatePickerTile(
+                  label: 'Окончание (не обязательно)',
+                  value: _stopDate,
+                  dateFormat: dateFormat,
+                  onTap: () async {
+                    final dt = await _selectDateTime(
+                      _stopDate ?? _startDate.add(const Duration(hours: 1)),
+                    );
+                    if (dt != null) setState(() => _stopDate = dt);
+                  },
+                  onClear: () => setState(() => _stopDate = null),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Get.back<PlaylistItem>(),
+          child: const Text('Отмена'),
+        ),
+        FilledButton(
+          onPressed: _save,
+          child: const Text('Сохранить'),
+        ),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helper tile for date picking inside dialog
+// ---------------------------------------------------------------------------
+
+class _DatePickerTile extends StatelessWidget {
+  const _DatePickerTile({
+    required this.label,
+    required this.value,
+    required this.dateFormat,
+    required this.onTap,
+    required this.onClear,
+  });
+
+  final String label;
+  final DateTime? value;
+  final DateFormat dateFormat;
+  final VoidCallback onTap;
+  final VoidCallback? onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(4),
+      child: InputDecorator(
+        decoration: InputDecoration(
+          labelText: label,
+          border: const OutlineInputBorder(),
+          isDense: true,
+          suffixIcon: (value != null && onClear != null)
+              ? IconButton(
+                  icon: const Icon(Icons.clear, size: 18),
+                  onPressed: onClear,
+                  padding: EdgeInsets.zero,
+                )
+              : null,
+        ),
         child: Padding(
-          padding: const EdgeInsets.only(left: 12.0),
+          padding: const EdgeInsets.only(top: 4, bottom: 4),
           child: Text(
-            initialDate == null
-                ? 'Не задано'
-                : DateFormat('dd.MM.yyyy HH:mm').format(initialDate),
-            style: TextStyle(color: initialDate == null ? Colors.grey : null),
+            value == null ? 'Не задано' : dateFormat.format(value!),
+            style: TextStyle(
+              color: value == null ? Colors.grey.shade500 : null,
+            ),
           ),
         ),
       ),
     );
-  }
-
-  Widget _buildFilenameField() {
-    return TextFormField(
-      controller: _filenameCtrl,
-      decoration: const InputDecoration(
-        labelText: 'Имя файла*',
-        hintText: 'video.mp4 или image.jpg',
-        border: OutlineInputBorder(),
-      ),
-      validator: (v) => v?.trim().isEmpty ?? true ? 'Обязательное поле' : null,
-    );
-  }
-
-  Widget _buildPickFileButton({bool fullWidth = false}) {
-    final button = ElevatedButton.icon(
-      onPressed: _pickAndCopyFile,
-      icon: const Icon(Icons.upload_file),
-      label: const Text('Выбрать файл'),
-      style: ElevatedButton.styleFrom(
-        backgroundColor: Colors.blue.shade700,
-        foregroundColor: Colors.white,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-      ),
-    );
-    if (!fullWidth) {
-      return button;
-    }
-    return SizedBox(width: double.infinity, child: button);
-  }
-
-  Widget _buildDurationField() {
-    return TextFormField(
-      initialValue: _durationSeconds.toString(),
-      keyboardType: TextInputType.number,
-      decoration: const InputDecoration(
-        labelText: 'Длительность (сек) для изображений',
-        border: OutlineInputBorder(),
-      ),
-      onChanged: (v) =>
-          setState(() => _durationSeconds = int.tryParse(v) ?? 10),
-    );
-  }
-
-  Widget _buildLoopField() {
-    return InputDecorator(
-      decoration: const InputDecoration(
-        labelText: 'Зациклить',
-        border: OutlineInputBorder(),
-      ),
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: Switch(
-          value: _loop,
-          onChanged: (v) => setState(() => _loop = v),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildUpdateButton() {
-    return ElevatedButton(
-      onPressed: _editingIndex != null ? _saveItem : null,
-      style: ElevatedButton.styleFrom(
-        backgroundColor: Colors.green.shade700,
-        padding: const EdgeInsets.symmetric(vertical: 16),
-      ),
-      child: const Text(
-        'Обновить элемент',
-        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-      ),
-    );
-  }
-
-  Widget _buildAddButton() {
-    return ElevatedButton(
-      onPressed: _editingIndex == null ? _saveItem : null,
-      style: ElevatedButton.styleFrom(
-        backgroundColor: Colors.blue.shade700,
-        padding: const EdgeInsets.symmetric(vertical: 16),
-      ),
-      child: const Text(
-        'Добавить элемент',
-        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-      ),
-    );
-  }
-
-  Future<DateTime?> _selectDateTime(
-    BuildContext context,
-    DateTime initialDate,
-  ) async {
-    final date = await showDatePicker(
-      context: context,
-      initialDate: initialDate,
-      firstDate: DateTime(2020),
-      lastDate: DateTime(2030),
-    );
-
-    if (date == null) return null;
-    if (!context.mounted) return null;
-
-    final time = await showTimePicker(
-      context: context,
-      initialTime: TimeOfDay.fromDateTime(initialDate),
-    );
-
-    if (time == null) return null;
-
-    return DateTime(date.year, date.month, date.day, time.hour, time.minute);
   }
 }
