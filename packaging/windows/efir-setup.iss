@@ -142,12 +142,13 @@ begin
         ResultCode
       );
       if ResultCode <> 0 then
-        Result := 'Не удалось установить Visual C++ Runtime (код: ' + IntToStr(ResultCode) + ').' +
-                  #13#10 + 'Установите вручную: https://aka.ms/vs/17/release/vc_redist.x64.exe';
+        { строка-продолжение не должна начинаться с # — ISPP примет её за директиву }
+        Result := 'Не удалось установить Visual C++ Runtime (код: ' + IntToStr(ResultCode) + ').' + #13#10 +
+                  'Установите вручную: https://aka.ms/vs/17/release/vc_redist.x64.exe';
     except
-      Result := 'Ошибка загрузки Visual C++ Runtime.' +
-                #13#10 + 'Проверьте интернет-соединение или установите вручную:' +
-                #13#10 + 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
+      Result := 'Ошибка загрузки Visual C++ Runtime.' + #13#10 +
+                'Проверьте интернет-соединение или установите вручную:' + #13#10 +
+                'https://aka.ms/vs/17/release/vc_redist.x64.exe';
     end;
   finally
     VCRedistPage.Hide;
