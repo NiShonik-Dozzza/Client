@@ -110,6 +110,10 @@ class _StatusScreenState extends State<StatusScreen> {
               ),
               _Row('Последний heartbeat',
                   _formatTime(_controller.lastHeartbeatAt.value)),
+              if (_controller.pinnedServerFingerprint() != null)
+                _Row('Сертификат (закреплён)',
+                    _controller.pinnedServerFingerprint()!,
+                    selectable: true),
             ]),
             _Section('Контент', [
               _Row('Текущая ревизия',

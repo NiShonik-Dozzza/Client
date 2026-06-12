@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
 import '../models/manifest.dart';
+import '../services/app_http.dart';
 import '../services/app_logger.dart';
 
 class DownloadForbidden implements Exception {
@@ -31,7 +32,7 @@ class MediaCacheService {
     http.Client? client,
     Future<void> Function()? onForbidden,
     String? Function()? tokenProvider,
-  }) : _client = client ?? http.Client(),
+  }) : _client = client ?? AppHttp.client(),
        _onForbidden = onForbidden,
        _tokenProvider = tokenProvider;
 

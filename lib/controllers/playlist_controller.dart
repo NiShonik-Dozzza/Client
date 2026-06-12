@@ -19,8 +19,27 @@ import '../services/device_store.dart';
 import '../services/manifest_store.dart';
 import '../services/media_cache_service.dart';
 import '../services/storage_service.dart';
+import '../services/trust_store.dart';
 
 enum DeviceSetupStage { booting, setupRequired, pendingApproval, ready }
+
+/// Предложение доверять самоподписанному сертификату сервера (TOFU).
+class TlsTrustPrompt {
+  const TlsTrustPrompt({
+    required this.host,
+    required this.port,
+    required this.fingerprintHex,
+    required this.subject,
+  });
+
+  final String host;
+  final int port;
+  final String fingerprintHex;
+  final String subject;
+
+  String get displayFingerprint =>
+      TrustStore.displayFingerprint(fingerprintHex);
+}
 
 class PlaylistController extends GetxController {
   String _clientVersion = 'efir-client';
@@ -30,6 +49,9 @@ class PlaylistController extends GetxController {
   final Rxn<DateTime> lastManifestSyncAt = Rxn<DateTime>();
   final RxBool lastHeartbeatOk = false.obs;
   final Rxn<DeviceHealth> serverHealth = Rxn<DeviceHealth>();
+
+  /// Ожидающее подтверждения TLS-доверие (заполняется при ошибке сертификата).
+  final Rxn<TlsTrustPrompt> pendingTlsPrompt = Rxn<TlsTrustPrompt>();
 
   // Место хранения контента (медиа-кэш) и рантайм-диагностика носителя.
   final RxString storageLocation = ''.obs;
@@ -249,6 +271,9 @@ class PlaylistController extends GetxController {
   Future<void> _boot() async {
     _isLoading.value = true;
     try {
+      // Пины сертификатов должны быть в памяти до создания HTTP-клиентов:
+      // badCertificateCallback синхронный.
+      await TrustStore.instance.load();
       await _loadClientVersion();
       final cfg = await _config.load();
       await _applyMediaRoot(cfg.mediaRoot);
@@ -358,6 +383,9 @@ class PlaylistController extends GetxController {
       return true;
     } catch (e) {
       await AppLogger.log('health check failed: $e');
+      if (_isTlsError(e)) {
+        await _prepareTlsPrompt(normalizedServer);
+      }
       showMessage(
         'Не удалось подключиться к серверу: ${_describeServerError(e)}. '
         'Проверьте адрес и сеть.',
@@ -421,6 +449,9 @@ class PlaylistController extends GetxController {
       return true;
     } catch (e) {
       await AppLogger.log('registration request failed: $e');
+      if (_isTlsError(e)) {
+        await _prepareTlsPrompt(normalizedServer);
+      }
       _setSetupRequired(
         'Не удалось отправить заявку: ${_describeServerError(e)}.',
       );
@@ -1038,6 +1069,79 @@ class PlaylistController extends GetxController {
       add(uri.replace(port: 8088)); // http:8088 (dev/LAN)
     }
     return out;
+  }
+
+  bool _isTlsError(Object e) =>
+      e is TlsException || e is HandshakeException;
+
+  /// При TLS-ошибке достаёт сертификат https-кандидата и готовит prompt
+  /// для подтверждения доверия оператором (UI покажет отпечаток).
+  Future<void> _prepareTlsPrompt(String normalizedServer) async {
+    try {
+      final httpsCandidate = _serverCandidates(normalizedServer)
+          .map(Uri.tryParse)
+          .whereType<Uri>()
+          .firstWhere((u) => u.scheme == 'https', orElse: () => Uri());
+      if (httpsCandidate.host.isEmpty) return;
+      final host = httpsCandidate.host;
+      final port = httpsCandidate.hasPort ? httpsCandidate.port : 443;
+
+      X509Certificate? captured;
+      try {
+        final socket = await SecureSocket.connect(
+          host,
+          port,
+          timeout: const Duration(seconds: 5),
+          onBadCertificate: (cert) {
+            captured = cert;
+            return false; // не подключаемся — только снимаем сертификат
+          },
+        );
+        await socket.close(); // цепочка оказалась валидной — доверие не нужно
+        return;
+      } catch (_) {
+        // ожидаемо: handshake отклонён нашим onBadCertificate
+      }
+      final cert = captured;
+      if (cert == null) return;
+
+      pendingTlsPrompt.value = TlsTrustPrompt(
+        host: host,
+        port: port,
+        fingerprintHex: TrustStore.fingerprintOf(cert),
+        subject: cert.subject,
+      );
+      await AppLogger.log(
+        'TLS trust prompt: $host:$port subject=${cert.subject}',
+      );
+    } catch (e) {
+      await AppLogger.log('TLS probe failed: $e');
+    }
+  }
+
+  /// Подтверждение доверия оператором: закрепить отпечаток и забыть prompt.
+  Future<void> acceptPendingTlsTrust() async {
+    final prompt = pendingTlsPrompt.value;
+    if (prompt == null) return;
+    await TrustStore.instance.trust(
+      prompt.host,
+      prompt.port,
+      prompt.fingerprintHex,
+    );
+    pendingTlsPrompt.value = null;
+  }
+
+  void dismissTlsPrompt() => pendingTlsPrompt.value = null;
+
+  /// Закреплённый отпечаток для текущего сервера (для диагностики).
+  String? pinnedServerFingerprint() {
+    final uri = Uri.tryParse(_serverAddress.value);
+    if (uri == null || uri.host.isEmpty || uri.scheme != 'https') return null;
+    final fp = TrustStore.instance.pinnedFingerprint(
+      uri.host,
+      uri.hasPort ? uri.port : 443,
+    );
+    return fp == null ? null : TrustStore.displayFingerprint(fp);
   }
 
   /// Человекочитаемая причина сетевой ошибки для setup-сообщений.

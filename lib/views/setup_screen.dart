@@ -52,18 +52,92 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _checkConnection() async {
-    await _controller.verifyServerConnection(
+    final ok = await _controller.verifyServerConnection(
       serverAddress: _serverController.text,
       deviceName: _nameController.text,
       keepStage: widget.settingsMode,
     );
+    if (!ok) await _maybeAskTlsTrust(retry: _checkConnection);
   }
 
   Future<void> _submitRequest() async {
-    await _controller.submitRegistrationRequest(
+    final ok = await _controller.submitRegistrationRequest(
       serverAddress: _serverController.text,
       deviceName: _nameController.text,
     );
+    if (!ok) await _maybeAskTlsTrust(retry: _submitRequest);
+  }
+
+  /// Сервер с самоподписанным сертификатом: показать отпечаток и спросить
+  /// оператора. При согласии — закрепить и повторить исходное действие.
+  Future<void> _maybeAskTlsTrust({required Future<void> Function() retry}) async {
+    final prompt = _controller.pendingTlsPrompt.value;
+    if (prompt == null || !mounted) return;
+    final accepted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.gpp_maybe_outlined, size: 22),
+            SizedBox(width: 8),
+            Expanded(child: Text('Сертификат сервера')),
+          ],
+        ),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Сервер ${prompt.host}:${prompt.port} использует сертификат, '
+                'не подписанный публичным центром сертификации '
+                '(собственный CA организации).',
+              ),
+              const SizedBox(height: 12),
+              Text(
+                prompt.subject,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 8),
+              const Text('Отпечаток SHA-256:'),
+              const SizedBox(height: 4),
+              SelectableText(
+                prompt.displayFingerprint,
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Сверьте отпечаток с указанным администратором сервера. '
+                'После подтверждения устройство будет доверять только '
+                'этому сертификату.',
+                style: TextStyle(color: Colors.grey),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Доверять'),
+          ),
+        ],
+      ),
+    );
+    if (accepted == true) {
+      await _controller.acceptPendingTlsTrust();
+      await retry();
+    } else {
+      _controller.dismissTlsPrompt();
+    }
   }
 
   Future<void> _refreshStatus() async {

@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 
 import '../models/display_profile.dart';
 import '../models/manifest.dart';
+import 'app_http.dart';
 
 class ApiException implements Exception {
   final int statusCode;
@@ -104,7 +105,7 @@ class DeviceRegistrationStatus {
 class ApiService {
   ApiService({required String serverBase, http.Client? client})
     : _serverBase = _normalizeServerBase(serverBase),
-      _client = client ?? http.Client();
+      _client = client ?? AppHttp.client();
 
   final http.Client _client;
   String _serverBase;
