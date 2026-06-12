@@ -189,6 +189,9 @@ class _WindowShellState extends State<WindowShell> {
     }
 
     if (event.logicalKey == LogicalKeyboardKey.escape) {
+      // В release не выходим из fullscreen по Esc (kiosk) и не перехватываем
+      // событие — оно нужно плееру для сервисного жеста (3×Esc → редактор).
+      if (kReleaseMode) return KeyEventResult.ignored;
       _toggleFullscreen(enabled: false);
       return KeyEventResult.handled;
     }
@@ -198,6 +201,9 @@ class _WindowShellState extends State<WindowShell> {
 
   void _handlePointerDown(PointerDownEvent event) {
     if (!_supportsDesktopToggle) return;
+    // В release double-tap не переключает fullscreen, чтобы экран нельзя было
+    // случайно свернуть (kiosk).
+    if (kReleaseMode) return;
 
     final now = DateTime.now();
     final lastAt = _lastPointerDownAt;

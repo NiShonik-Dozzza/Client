@@ -80,7 +80,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   // ===== ДОБАВЛЕНО: поддержка редактора =====
   bool _isEditorOpen = false; // Отслеживает открыт ли редактор
-  bool _showEditorButton = false; // Состояние видимости кнопки
   // ==========================================
 
   Timer? _tick; // проверяем расписание
@@ -533,9 +532,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _boot();
   }
 
-  // TV remote: отслеживаем быстрые нажатия кнопки "назад" для сервисного меню
-  int _backPressCount = 0;
+  // Сервисные жесты входа в редактор: серия быстрых нажатий/тапов.
+  static const Duration _serviceGestureWindow = Duration(milliseconds: 600);
+  int _backPressCount = 0; // Android/TV пульт: 5×Back
   DateTime? _lastBackPressAt;
+  int _escPressCount = 0; // Desktop: 3×Esc
+  DateTime? _lastEscPressAt;
+  int _tapCount = 0; // Touch: серия тапов по экрану
+  DateTime? _lastTapAt;
+
+  /// Считает быстрые тапы по экрану; по достижении порога открывает редактор.
+  /// Для тач-устройств без клавиатуры/пульта.
+  void _handleServiceTap() {
+    if (_isEditorOpen) return;
+    final now = DateTime.now();
+    final last = _lastTapAt;
+    if (last != null && now.difference(last) < _serviceGestureWindow) {
+      _tapCount++;
+    } else {
+      _tapCount = 1;
+    }
+    _lastTapAt = now;
+    if (_tapCount >= 5) {
+      _tapCount = 0;
+      _openEditor();
+    }
+  }
 
   bool _onKey(KeyEvent e) {
     if (e is KeyDownEvent) {
@@ -558,13 +580,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
         return true;
       }
 
+      // Desktop: 3 быстрых нажатия Esc → сервисный редактор.
+      // (PIN добавляет второй уровень. В release Esc не сворачивает fullscreen,
+      //  поэтому серия нажатий не трогает окно — см. WindowShell в main.dart.)
+      if (e.logicalKey == LogicalKeyboardKey.escape) {
+        final now = DateTime.now();
+        final last = _lastEscPressAt;
+        if (last != null && now.difference(last) < _serviceGestureWindow) {
+          _escPressCount++;
+        } else {
+          _escPressCount = 1;
+        }
+        _lastEscPressAt = now;
+        if (_escPressCount >= 3 && !_isEditorOpen) {
+          _escPressCount = 0;
+          _openEditor();
+          return true;
+        }
+        return false;
+      }
+
       // Android TV remote: 5 быстрых нажатий Back → сервисный редактор
-      // (защита от случайного открытия; PIN добавляет второй уровень)
-      if (e.logicalKey == LogicalKeyboardKey.goBack ||
-          e.logicalKey == LogicalKeyboardKey.escape) {
+      // (защита от случайного открытия; PIN добавляет второй уровень).
+      if (e.logicalKey == LogicalKeyboardKey.goBack) {
         final now = DateTime.now();
         final last = _lastBackPressAt;
-        if (last != null && now.difference(last) < const Duration(milliseconds: 600)) {
+        if (last != null && now.difference(last) < _serviceGestureWindow) {
           _backPressCount++;
         } else {
           _backPressCount = 1;
@@ -1641,7 +1682,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
+      // Перехват серии тапов по экрану → вход в сервисный редактор
+      // (для тач-устройств без клавиатуры/пульта). translucent не мешает плееру.
+      body: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (_) => _handleServiceTap(),
+        child: Stack(
         fit: StackFit.expand,
         children: [
           Positioned.fill(
@@ -1651,44 +1697,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
           ),
 
-          // ===== ДОБАВЛЕНО: кнопка редактора при наведении мыши =====
-          // Новый исправленный код:
-          Positioned(
-            top: 0,
-            left: 0,
-            width: 150, // Увеличим область для захвата
-            height: 150,
-            child: MouseRegion(
-              onEnter: (_) => setState(() => _showEditorButton = true),
-              onExit: (_) => setState(() => _showEditorButton = false),
-              child: Stack(
-                children: [
-                  // Невидимая область для отладки (можно временно раскомментировать)
-                  // Container(color: Colors.red.withOpacity(0.1)),
-
-                  // Кнопка редактора
-                  if (_showEditorButton && !_isEditorOpen)
-                    Positioned(
-                      top: 20,
-                      left: 20,
-                      child: FloatingActionButton(
-                        onPressed: _openEditor,
-                        backgroundColor: Colors.red.shade700,
-                        elevation: 8,
-                        tooltip: 'Открыть редактор (F2)',
-                        child: const Icon(
-                          Icons.edit,
-                          size: 30,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ),
-
-          // ============================================================
           // Buffering indicator - small spinner in bottom-right when video is buffering
           if (_mode == _Mode.video && _playerBuffering[_activeVideoIndex])
             Positioned(
@@ -1742,6 +1750,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ),
             ),
         ],
+        ),
       ),
     );
   }
@@ -1788,28 +1797,52 @@ class _PinDialog extends StatefulWidget {
 }
 
 class _PinDialogState extends State<_PinDialog> {
+  static const Duration _idleTimeout = Duration(seconds: 30);
+
   final _controller = TextEditingController();
   bool _obscure = true;
   String? _error;
+  Timer? _idleTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _resetIdle();
+  }
+
+  /// Сбрасывает таймер бездействия. По истечении 30 c без действий диалог
+  /// сам закрывается (без результата — редактор не открывается).
+  void _resetIdle() {
+    _idleTimer?.cancel();
+    _idleTimer = Timer(_idleTimeout, () {
+      if (mounted) Get.back<String>();
+    });
+  }
 
   void _submit() {
     final value = _controller.text.trim();
     if (value.isEmpty) {
+      _resetIdle();
       setState(() => _error = 'Введите PIN-код');
       return;
     }
+    _idleTimer?.cancel();
     Get.back(result: value);
   }
 
   @override
   void dispose() {
+    _idleTimer?.cancel();
     _controller.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: (_) => _resetIdle(),
+      child: AlertDialog(
       title: const Row(
         children: [
           Icon(Icons.lock_outline, size: 20),
@@ -1843,6 +1876,7 @@ class _PinDialogState extends State<_PinDialog> {
               ),
               onSubmitted: (_) => _submit(),
               onChanged: (_) {
+                _resetIdle();
                 if (_error != null) setState(() => _error = null);
               },
             ),
@@ -1859,6 +1893,7 @@ class _PinDialogState extends State<_PinDialog> {
           child: const Text('Войти'),
         ),
       ],
+      ),
     );
   }
 }
