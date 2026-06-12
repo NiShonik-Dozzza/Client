@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:get/get.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import '../models/display_profile.dart';
 import '../models/manifest.dart';
@@ -17,11 +18,26 @@ import '../services/display_service.dart';
 import '../services/device_store.dart';
 import '../services/manifest_store.dart';
 import '../services/media_cache_service.dart';
+import '../services/storage_service.dart';
 
 enum DeviceSetupStage { booting, setupRequired, pendingApproval, ready }
 
 class PlaylistController extends GetxController {
-  static const String _clientVersion = 'efir-client 1.0.0+1';
+  String _clientVersion = 'efir-client';
+
+  // Диагностика устройства для status screen.
+  final Rxn<DateTime> lastHeartbeatAt = Rxn<DateTime>();
+  final Rxn<DateTime> lastManifestSyncAt = Rxn<DateTime>();
+  final RxBool lastHeartbeatOk = false.obs;
+  final Rxn<DeviceHealth> serverHealth = Rxn<DeviceHealth>();
+
+  // Место хранения контента (медиа-кэш) и рантайм-диагностика носителя.
+  final RxString storageLocation = ''.obs;
+  final RxString storageWarning = ''.obs;
+  final RxBool storageSlow = false.obs;
+  final RxString lastStorageEvent = ''.obs;
+  final Rxn<DateTime> lastStorageCheckAt = Rxn<DateTime>();
+  final RxInt storageLatencyMs = 0.obs;
 
   final RxBool _isLoading = false.obs;
   final RxInt version = 0.obs;
@@ -45,6 +61,7 @@ class PlaylistController extends GetxController {
   final _displayService = DisplayService();
   final _deviceStore = DeviceStore();
   final _manifestStore = ManifestStore();
+  final _storage = StorageService();
   late final MediaCacheService _cache;
 
   ApiService? _api;
@@ -56,6 +73,7 @@ class PlaylistController extends GetxController {
   Timer? _manifestTimer;
   Timer? _heartbeatTimer;
   Timer? _registrationPollTimer;
+  Timer? _storageTimer;
   int _manifestFailures = 0;
   bool _manifestInFlight = false;
   Future<void> _prefetchChain = Future.value();
@@ -64,6 +82,8 @@ class PlaylistController extends GetxController {
   static const Duration _manifestBaseInterval = Duration(seconds: 5);
   static const Duration _heartbeatInterval = Duration(seconds: 25);
   static const List<int> _manifestBackoffSeconds = [2, 5, 10, 20, 30];
+  static const Duration _storageCheckInterval = Duration(seconds: 15);
+  static const Duration _storageSlowThreshold = Duration(milliseconds: 1500);
 
   bool get isLoading => _isLoading.value;
   DeviceSetupStage get setupStage => _setupStage.value;
@@ -101,6 +121,115 @@ class PlaylistController extends GetxController {
   List<ManifestItem> get items => _manifest?.items ?? [];
   List<PlaylistItem> get editorItems => localItems.toList();
   String get servicePin => _config.cached?.servicePin ?? '';
+  String get clientVersion => _clientVersion;
+  String get mediaRoot => _mediaRoot;
+  String get configuredStorage => _config.cached?.mediaRoot ?? '';
+  Future<MediaCacheDiagnostics> cacheDiagnostics() =>
+      _cache.diagnostics(_manifest, _mediaRoot);
+
+  Future<List<StorageVolume>> listStorageVolumes() => _storage.listVolumes();
+
+  /// Применяет место хранения с проверкой записи. Если выбранный носитель
+  /// недоступен (вынули USB) — откат на внутреннюю память + предупреждение,
+  /// при этом выбор пользователя в конфиге НЕ перезаписываем (вернётся при
+  /// следующем подключении носителя).
+  Future<void> _applyMediaRoot(String desired) async {
+    if (await _storage.isWritable(desired)) {
+      _mediaRoot = desired;
+      storageLocation.value = desired;
+      storageWarning.value = '';
+      return;
+    }
+    final internal = await _storage.internalVolume();
+    _mediaRoot = internal.mediaPath;
+    storageLocation.value = internal.mediaPath;
+    storageWarning.value =
+        'Выбранный носитель недоступен — контент сохраняется во внутреннюю память.';
+    await AppLogger.log(
+      'storage fallback to internal: desired=$desired actual=${internal.mediaPath}',
+    );
+  }
+
+  /// Меняет место хранения контента: проверяет запись, сохраняет в конфиг,
+  /// перенаправляет префетч в новую папку.
+  Future<bool> setStorageLocation(String mediaPath) async {
+    if (!await _storage.isWritable(mediaPath)) {
+      storageWarning.value = 'Носитель недоступен для записи.';
+      return false;
+    }
+    await _config.setMediaRoot(mediaPath);
+    _mediaRoot = mediaPath;
+    storageLocation.value = mediaPath;
+    storageWarning.value = '';
+    await AppLogger.log('storage location set: $mediaPath');
+    final manifest = _manifest;
+    if (manifest != null) {
+      _prefetchMedia(manifest);
+    }
+    version.value++;
+    return true;
+  }
+
+  void _startStorageMonitor() {
+    _storageTimer?.cancel();
+    _storageTimer = Timer.periodic(
+      _storageCheckInterval,
+      (_) => _checkStorageHealth(),
+    );
+  }
+
+  /// Рантайм-контроль носителя:
+  /// - носитель пропал (вынули USB) → откат на внутреннюю память + событие;
+  /// - носитель вернулся → возврат на него + перекачка контента;
+  /// - носитель отвечает медленно → флаг storageSlow + предупреждение.
+  /// Всё пишется в лог (`storage event: ...`) и видно в StatusScreen.
+  Future<void> _checkStorageHealth() async {
+    final desired = _config.cached?.mediaRoot ?? _mediaRoot;
+    final internalPath = await _storage.internalMediaPath();
+    final result = await _storage.probe(desired);
+    lastStorageCheckAt.value = DateTime.now();
+    storageLatencyMs.value = result.latency.inMilliseconds;
+
+    if (!result.ok) {
+      storageSlow.value = false;
+      // Если работали именно на этом (теперь недоступном) носителе — откат.
+      if (_mediaRoot == desired && desired != internalPath) {
+        _mediaRoot = internalPath;
+        storageLocation.value = internalPath;
+        lastStorageEvent.value =
+            'removed ${DateTime.now().toIso8601String()} (${result.error})';
+        await AppLogger.log(
+          'storage event: removed desired=$desired error=${result.error} -> internal=$internalPath',
+        );
+        final manifest = _manifest;
+        if (manifest != null) _prefetchMedia(manifest);
+      }
+      storageWarning.value = desired == internalPath
+          ? 'Внутренняя память недоступна для записи (${result.error}).'
+          : 'Выбранный носитель недоступен (${result.error}) — контент во внутренней памяти.';
+      return;
+    }
+
+    final slow = result.latency >= _storageSlowThreshold;
+    storageSlow.value = slow;
+
+    // Были на откате, а выбранный носитель вернулся — возвращаемся на него.
+    if (_mediaRoot != desired) {
+      _mediaRoot = desired;
+      storageLocation.value = desired;
+      lastStorageEvent.value =
+          'restored ${DateTime.now().toIso8601String()} (${result.latency.inMilliseconds}ms)';
+      await AppLogger.log(
+        'storage event: restored desired=$desired latency=${result.latency.inMilliseconds}ms',
+      );
+      final manifest = _manifest;
+      if (manifest != null) _prefetchMedia(manifest);
+    }
+
+    storageWarning.value = slow
+        ? 'Носитель отвечает медленно (${result.latency.inMilliseconds} мс) — возможны задержки контента.'
+        : '';
+  }
 
   @override
   void onInit() {
@@ -113,14 +242,17 @@ class PlaylistController extends GetxController {
     _manifestTimer?.cancel();
     _heartbeatTimer?.cancel();
     _registrationPollTimer?.cancel();
+    _storageTimer?.cancel();
     super.onClose();
   }
 
   Future<void> _boot() async {
     _isLoading.value = true;
     try {
+      await _loadClientVersion();
       final cfg = await _config.load();
-      _mediaRoot = cfg.mediaRoot;
+      await _applyMediaRoot(cfg.mediaRoot);
+      _startStorageMonitor();
       _serverAddress.value = cfg.serverUrl;
       _selectedDisplayId.value = cfg.selectedDisplayId;
       _localDisplayRotation.value = _normalizeRotation(cfg.displayRotation);
@@ -187,12 +319,23 @@ class PlaylistController extends GetxController {
   Future<bool> verifyServerConnection({
     String? serverAddress,
     String? deviceName,
+    bool keepStage = false,
   }) async {
+    // В режиме «Настройки» (устройство уже ready) не меняем setupStage —
+    // иначе ready-экран выкинуло бы обратно в регистрацию.
+    void showMessage(String message) {
+      if (keepStage) {
+        _setupMessage.value = message;
+      } else {
+        _setSetupRequired(message);
+      }
+    }
+
     final normalizedServer = _normalizeServerAddress(
       serverAddress ?? _serverAddress.value,
     );
     if (normalizedServer.isEmpty) {
-      _setSetupRequired('Введите IP-адрес или доменное имя сервера.');
+      showMessage('Введите IP-адрес или доменное имя сервера.');
       return false;
     }
 
@@ -207,7 +350,7 @@ class PlaylistController extends GetxController {
       }
       _api?.updateServerBase(resolvedServer);
       await _config.setServerUrl(resolvedServer);
-      _setSetupRequired(
+      showMessage(
         resolvedServer == normalizedServer
             ? 'Соединение установлено: ${health.name} ${health.version}, часовой пояс ${health.timezone}.'
             : 'Соединение установлено: ${health.name} ${health.version}, часовой пояс ${health.timezone}. Использую адрес $resolvedServer.',
@@ -215,8 +358,9 @@ class PlaylistController extends GetxController {
       return true;
     } catch (e) {
       await AppLogger.log('health check failed: $e');
-      _setSetupRequired(
-        'Не удалось подключиться к серверу. Проверьте адрес и маршрут.',
+      showMessage(
+        'Не удалось подключиться к серверу: ${_describeServerError(e)}. '
+        'Проверьте адрес и сеть.',
       );
       return false;
     } finally {
@@ -278,7 +422,7 @@ class PlaylistController extends GetxController {
     } catch (e) {
       await AppLogger.log('registration request failed: $e');
       _setSetupRequired(
-        'Не удалось отправить заявку. Проверьте доступ к серверу.',
+        'Не удалось отправить заявку: ${_describeServerError(e)}.',
       );
       return false;
     } finally {
@@ -579,6 +723,7 @@ class PlaylistController extends GetxController {
         token: auth.token,
       );
       _manifestFailures = 0;
+      lastManifestSyncAt.value = DateTime.now();
       final currentManifest = _manifest;
       if (currentManifest != null &&
           currentManifest.revision == manifest.revision) {
@@ -715,6 +860,26 @@ class PlaylistController extends GetxController {
 
   String _manifestSignature(Manifest manifest) => jsonEncode(manifest.toJson());
 
+  Future<void> _loadClientVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      _clientVersion = 'efir-client ${info.version}+${info.buildNumber}';
+    } catch (e) {
+      await AppLogger.log('client version load failed: $e');
+    }
+  }
+
+  /// Запрашивает health сервера для status screen. Безопасно при ошибке.
+  Future<void> refreshServerHealth() async {
+    final api = _api;
+    if (api == null) return;
+    try {
+      serverHealth.value = await api.health();
+    } catch (e) {
+      await AppLogger.log('server health refresh failed: $e');
+    }
+  }
+
   Future<void> _sendHeartbeat() async {
     if (isOfflineMode.value || !isReady) return;
 
@@ -737,13 +902,17 @@ class PlaylistController extends GetxController {
         availableDisplays: availableDisplays,
         token: auth.token,
       );
+      lastHeartbeatAt.value = DateTime.now();
+      lastHeartbeatOk.value = true;
     } on ApiException catch (e) {
+      lastHeartbeatOk.value = false;
       await AppLogger.log('heartbeat failed: $e');
       _syncDiagnostics.value = 'heartbeat error ${e.statusCode}';
       if (e.statusCode == 401 || e.statusCode == 403 || e.statusCode == 404) {
         await _handleAuthLoss('heartbeat ${e.statusCode}');
       }
     } catch (e) {
+      lastHeartbeatOk.value = false;
       await AppLogger.log('heartbeat failed: $e');
     }
   }
@@ -767,6 +936,10 @@ class PlaylistController extends GetxController {
   Future<File?> ensureMediaFile(ManifestMedia media) =>
       _cache.ensureMediaFile(media, _mediaRoot);
 
+  /// Путь к закэшированному файлу медиа без скачивания (для превью в таймлайне).
+  Future<String?> cachedMediaPath(ManifestMedia media) async =>
+      (await _cache.cachedFile(media, _mediaRoot))?.path;
+
   String _deviceName() {
     if (kIsWeb) return 'web';
     return Platform.localHostname;
@@ -781,7 +954,10 @@ class PlaylistController extends GetxController {
 
   Future<void> _repairServerAddressIfNeeded() async {
     final current = _serverAddress.value;
-    if (!_shouldTryHttpPortFallback(current)) {
+    final uri = Uri.tryParse(_normalizeServerAddress(current));
+    // Перепроверяем только голый http-хост без порта: его можно поднять до
+    // https (боевой за nginx) или dev-порта. Явный https/порт не трогаем.
+    if (uri == null || uri.host.isEmpty || uri.scheme != 'http' || uri.hasPort) {
       return;
     }
 
@@ -827,33 +1003,56 @@ class PlaylistController extends GetxController {
     throw StateError('No server candidates to probe');
   }
 
+  /// Кандидаты для проб health при резолве адреса сервера.
+  ///
+  /// Пользователь вводит только хост (или хост:порт) — протокол подбираем сами.
+  /// HTTPS пробуем первым: боевой сервер за nginx редиректит HTTP→HTTPS (301),
+  /// а Dart `http` следует за редиректом только для GET — POST (регистрация/
+  /// heartbeat) ловит 301. Зафиксировав базу как `https://...`, POST идёт
+  /// напрямую. HTTP и dev-порт 8088 остаются фолбэком для LAN-стенда без TLS.
+  /// Явный `https://` от пользователя не понижаем до http.
   List<String> _serverCandidates(String normalized) {
-    final candidates = <String>[normalized];
-    if (!_shouldTryHttpPortFallback(normalized)) {
-      return candidates;
-    }
-
-    final uri = Uri.parse(normalized);
-    for (final fallbackPort in [8088, 443]) {
-      final fallback = uri
-          .replace(port: fallbackPort)
-          .toString()
-          .replaceFirst(RegExp(r'/$'), '');
-      if (!candidates.contains(fallback)) {
-        candidates.add(fallback);
-      }
-    }
-    return candidates;
-  }
-
-  bool _shouldTryHttpPortFallback(String value) {
-    final normalized = _normalizeServerAddress(value);
-    if (normalized.isEmpty) return false;
     final uri = Uri.tryParse(normalized);
     if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
-      return false;
+      return [normalized];
     }
-    return uri.scheme == 'http' && !uri.hasPort;
+
+    String strip(Uri u) => u.toString().replaceFirst(RegExp(r'/$'), '');
+    final out = <String>[];
+    void add(Uri u) {
+      final value = strip(u);
+      if (!out.contains(value)) out.add(value);
+    }
+
+    if (uri.scheme == 'https') {
+      add(uri); // явный https уважаем, не понижаем
+      return out;
+    }
+
+    if (uri.hasPort) {
+      add(uri.replace(scheme: 'https')); // https на том же порту
+      add(uri); // http на том же порту
+    } else {
+      add(uri.replace(scheme: 'https')); // https:443
+      add(uri); // http:80
+      add(uri.replace(port: 8088)); // http:8088 (dev/LAN)
+    }
+    return out;
+  }
+
+  /// Человекочитаемая причина сетевой ошибки для setup-сообщений.
+  String _describeServerError(Object e) {
+    if (e is TimeoutException) return 'сервер не ответил вовремя';
+    if (e is TlsException) return 'ошибка TLS-сертификата сервера';
+    if (e is SocketException) {
+      final msg = (e.osError?.message ?? e.message).toLowerCase();
+      if (msg.contains('lookup') || msg.contains('resolve')) {
+        return 'имя сервера не разрешается (DNS)';
+      }
+      return 'нет соединения с сервером';
+    }
+    if (e is ApiException) return 'сервер вернул ошибку ${e.statusCode}';
+    return 'неизвестная ошибка';
   }
 
   String _normalizeServerAddress(String raw) {

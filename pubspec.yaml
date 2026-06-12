@@ -43,13 +43,14 @@ dependencies:
   media_kit_libs_video: ^1.0.7
   http: ^1.4.0
   crypto: ^3.0.6
-  window_manager: ^0.4.3
+  window_manager: ^0.5.1
   wakelock_plus: ^1.4.0
   # для эдитора
   file_picker:
     path: third_party/flutter_plugins/file_picker
-  intl: ^0.19.0
+  intl: ^0.20.2
   screen_retriever: ^0.2.0
+  package_info_plus: ^10.1.0 # фактическая версия задаётся dependency_overrides (локальный путь)
 
 dev_dependencies:
   flutter_test:

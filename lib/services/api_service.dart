@@ -19,12 +19,16 @@ class DeviceHealth {
   final bool ok;
   final String name;
   final String version;
+  final String build;
+  final String revision;
   final String timezone;
 
   DeviceHealth({
     required this.ok,
     required this.name,
     required this.version,
+    required this.build,
+    required this.revision,
     required this.timezone,
   });
 
@@ -33,6 +37,8 @@ class DeviceHealth {
       ok: json['ok'] == true,
       name: (json['name'] as String?)?.trim() ?? '',
       version: (json['version'] as String?)?.trim() ?? '',
+      build: (json['build'] as String?)?.trim() ?? '',
+      revision: (json['revision'] as String?)?.trim() ?? '',
       timezone: (json['timezone'] as String?)?.trim() ?? '',
     );
   }
@@ -108,7 +114,11 @@ class ApiService {
   }
 
   Future<DeviceHealth> health() async {
-    final resp = await _client.get(_buildUri('/api/v1/device/health'));
+    // Таймаут ограничивает пробу: при резолве адреса мы перебираем кандидаты
+    // (https/http/порты), и недоступный кандидат не должен подвешивать UI.
+    final resp = await _client
+        .get(_buildUri('/api/v1/device/health'))
+        .timeout(const Duration(seconds: 5));
     return DeviceHealth.fromJson(_decodeMap(resp));
   }
 

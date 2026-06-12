@@ -3,9 +3,14 @@ import 'package:get/get.dart';
 
 import '../controllers/playlist_controller.dart';
 import '../models/display_profile.dart';
+import '../services/storage_service.dart';
 
 class SetupScreen extends StatefulWidget {
-  const SetupScreen({super.key});
+  const SetupScreen({super.key, this.settingsMode = false});
+
+  /// true — экран открыт как «Настройки» после регистрации: без флоу
+  /// регистрации, имя устройства только для чтения, есть кнопка «Готово».
+  final bool settingsMode;
 
   @override
   State<SetupScreen> createState() => _SetupScreenState();
@@ -50,6 +55,7 @@ class _SetupScreenState extends State<SetupScreen> {
     await _controller.verifyServerConnection(
       serverAddress: _serverController.text,
       deviceName: _nameController.text,
+      keepStage: widget.settingsMode,
     );
   }
 
@@ -92,6 +98,14 @@ class _SetupScreenState extends State<SetupScreen> {
     final theme = Theme.of(context);
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6FA),
+      appBar: widget.settingsMode
+          ? AppBar(
+              backgroundColor: Colors.white,
+              elevation: 0,
+              foregroundColor: const Color(0xFF1F2533),
+              title: const Text('Настройки устройства'),
+            )
+          : null,
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, viewportConstraints) {
@@ -120,14 +134,16 @@ class _SetupScreenState extends State<SetupScreen> {
                         mainAxisAlignment: MainAxisAlignment.center,
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
-                          Text(
-                            'Первичная настройка устройства',
-                            style: theme.textTheme.headlineSmall?.copyWith(
-                              fontWeight: FontWeight.w700,
-                              color: const Color(0xFF1F2533),
+                          if (!widget.settingsMode) ...[
+                            Text(
+                              'Первичная настройка устройства',
+                              style: theme.textTheme.headlineSmall?.copyWith(
+                                fontWeight: FontWeight.w700,
+                                color: const Color(0xFF1F2533),
+                              ),
                             ),
-                          ),
-                          const SizedBox(height: 24),
+                            const SizedBox(height: 24),
+                          ],
                           Container(
                             padding: const EdgeInsets.all(24),
                             decoration: BoxDecoration(
@@ -157,19 +173,22 @@ class _SetupScreenState extends State<SetupScreen> {
                                   enabled: !busy,
                                   decoration: const InputDecoration(
                                     labelText: 'Адрес сервера',
-                                    hintText:
-                                        'Например: 192.168.1.50:8088 или http://192.168.1.50:8088',
                                     border: OutlineInputBorder(),
                                   ),
                                 ),
                                 const SizedBox(height: 16),
                                 TextField(
                                   controller: _nameController,
-                                  enabled: !busy,
-                                  decoration: const InputDecoration(
+                                  enabled: !busy && !widget.settingsMode,
+                                  decoration: InputDecoration(
                                     labelText: 'Имя устройства',
-                                    hintText: 'Например: Экран ресепшн',
-                                    border: OutlineInputBorder(),
+                                    hintText: widget.settingsMode
+                                        ? null
+                                        : 'Например: Экран ресепшн',
+                                    helperText: widget.settingsMode
+                                        ? 'Имя меняется в панели управления'
+                                        : null,
+                                    border: const OutlineInputBorder(),
                                   ),
                                 ),
                                 const SizedBox(height: 24),
@@ -285,23 +304,29 @@ class _SetupScreenState extends State<SetupScreen> {
                                       onPressed: busy ? null : _checkConnection,
                                       child: const Text('Проверить соединение'),
                                     ),
-                                    if (pending)
+                                    if (!widget.settingsMode && pending)
                                       OutlinedButton(
                                         onPressed: busy ? null : _resetFlow,
                                         child: const Text('Изменить настройки'),
                                       ),
-                                    ElevatedButton(
-                                      onPressed: busy
-                                          ? null
-                                          : pending
-                                          ? _refreshStatus
-                                          : _submitRequest,
-                                      child: Text(
-                                        pending
-                                            ? 'Проверить статус'
-                                            : 'Отправить заявку',
+                                    if (!widget.settingsMode)
+                                      ElevatedButton(
+                                        onPressed: busy
+                                            ? null
+                                            : pending
+                                            ? _refreshStatus
+                                            : _submitRequest,
+                                        child: Text(
+                                          pending
+                                              ? 'Проверить статус'
+                                              : 'Отправить заявку',
+                                        ),
                                       ),
-                                    ),
+                                    if (widget.settingsMode)
+                                      FilledButton(
+                                        onPressed: busy ? null : Get.back,
+                                        child: const Text('Готово'),
+                                      ),
                                   ],
                                 ),
                                 if (busy) ...[
@@ -310,7 +335,7 @@ class _SetupScreenState extends State<SetupScreen> {
                                     child: CircularProgressIndicator(),
                                   ),
                                 ],
-                                if (pending) ...[
+                                if (!widget.settingsMode && pending) ...[
                                   const SizedBox(height: 18),
                                   Text(
                                     'После подтверждения устройство автоматически начнет синхронизацию.',
@@ -322,6 +347,8 @@ class _SetupScreenState extends State<SetupScreen> {
                               ],
                             ),
                           ),
+                          const SizedBox(height: 24),
+                          const _StorageSetupCard(),
                           const SizedBox(height: 24),
                           _PinSetupCard(
                             controller: _pinController,
@@ -337,6 +364,230 @@ class _SetupScreenState extends State<SetupScreen> {
             ),  // close SingleChildScrollView
           );    // close FocusTraversalGroup
           },    // close LayoutBuilder builder
+        ),
+      ),
+    );
+  }
+}
+
+class _StorageSetupCard extends StatefulWidget {
+  const _StorageSetupCard();
+
+  @override
+  State<_StorageSetupCard> createState() => _StorageSetupCardState();
+}
+
+class _StorageSetupCardState extends State<_StorageSetupCard> {
+  PlaylistController get _controller => Get.find<PlaylistController>();
+
+  List<StorageVolume> _volumes = const [];
+  bool _loading = false;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    final volumes = await _controller.listStorageVolumes();
+    if (!mounted) return;
+    setState(() {
+      _volumes = volumes;
+      _loading = false;
+    });
+  }
+
+  Future<void> _select(StorageVolume volume) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    await _controller.setStorageLocation(volume.mediaPath);
+    if (!mounted) return;
+    setState(() => _busy = false);
+    await _load();
+  }
+
+  static String _formatBytes(int? bytes) {
+    if (bytes == null) return '';
+    if (bytes < 1024) return '$bytes B';
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    var value = bytes / 1024;
+    var unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return '${value.toStringAsFixed(1)} ${units[unit]} свободно';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: const Color(0xFFD8DFEA)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x14000000),
+            blurRadius: 24,
+            offset: Offset(0, 12),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.sd_storage_outlined,
+                  size: 20, color: Color(0xFF1F2533)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Где хранить контент',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: const Color(0xFF1F2533),
+                  ),
+                ),
+              ),
+              TextButton.icon(
+                onPressed: _loading || _busy ? null : _load,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Обновить'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Если внутренней памяти мало — выберите внешний носитель (флешку/диск). '
+            'Если носитель отключат, клиент временно перейдёт на внутреннюю память.',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: const Color(0xFF5F6B84),
+            ),
+          ),
+          const SizedBox(height: 16),
+          if (_loading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 16),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else
+            Obx(() {
+              final current = _controller.storageLocation.value;
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (final volume in _volumes)
+                    _StorageTile(
+                      volume: volume,
+                      selected: volume.mediaPath == current,
+                      freeLabel: _formatBytes(volume.freeBytes),
+                      onTap: _busy ? null : () => _select(volume),
+                    ),
+                ],
+              );
+            }),
+          Obx(() {
+            final warning = _controller.storageWarning.value;
+            if (warning.isEmpty) return const SizedBox.shrink();
+            return Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Row(
+                children: [
+                  Icon(Icons.warning_amber_rounded,
+                      size: 18, color: Colors.orange.shade800),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      warning,
+                      style: TextStyle(color: Colors.orange.shade800),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+}
+
+class _StorageTile extends StatelessWidget {
+  const _StorageTile({
+    required this.volume,
+    required this.selected,
+    required this.freeLabel,
+    required this.onTap,
+  });
+
+  final StorageVolume volume;
+  final bool selected;
+  final String freeLabel;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final borderColor =
+        selected ? const Color(0xFF3167E3) : const Color(0xFFD8DFEA);
+    final subtitleParts = <String>[
+      volume.isInternal ? 'Внутренняя' : 'Внешний носитель',
+      if (freeLabel.isNotEmpty) freeLabel,
+    ];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(14),
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: selected ? const Color(0xFFF4F8FF) : Colors.white,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: borderColor, width: selected ? 2 : 1),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                volume.isInternal ? Icons.storage : Icons.usb,
+                color: selected
+                    ? const Color(0xFF3167E3)
+                    : const Color(0xFF5F6B84),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      volume.label,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF1F2533),
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitleParts.join(' · '),
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF5F6B84),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (selected)
+                const Icon(Icons.check_circle,
+                    color: Color(0xFF3167E3), size: 22),
+            ],
+          ),
         ),
       ),
     );

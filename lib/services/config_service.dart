@@ -96,15 +96,13 @@ class ConfigService {
 
   Future<void> setMediaRoot(String newRoot) async {
     final file = await AppPaths.configFile();
+    final current = _cached ?? await load();
     final cfg = AppConfig(
       mediaRoot: newRoot,
-      serverUrl: _cached?.serverUrl ?? AppConfig.defaults(newRoot).serverUrl,
-      selectedDisplayId:
-          _cached?.selectedDisplayId ??
-          AppConfig.defaults(newRoot).selectedDisplayId,
-      displayRotation:
-          _cached?.displayRotation ??
-          AppConfig.defaults(newRoot).displayRotation,
+      serverUrl: current.serverUrl,
+      selectedDisplayId: current.selectedDisplayId,
+      displayRotation: current.displayRotation,
+      servicePin: current.servicePin,
     );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
@@ -119,6 +117,7 @@ class ConfigService {
       serverUrl: normalized,
       selectedDisplayId: _cached?.selectedDisplayId ?? '',
       displayRotation: _cached?.displayRotation ?? 0,
+      servicePin: _cached?.servicePin ?? '',
     );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
@@ -158,6 +157,7 @@ class ConfigService {
       displayRotation: _normalizeRotation(
         displayRotation ?? current.displayRotation,
       ),
+      servicePin: current.servicePin,
     );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;

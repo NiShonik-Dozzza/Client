@@ -5,9 +5,12 @@ import 'package:get/get.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:intl/intl.dart';
 import '../controllers/playlist_controller.dart';
+import '../models/manifest.dart';
 import '../models/playlist_item.dart';
 import '../services/app_paths.dart';
 import '../services/app_logger.dart';
+import 'status_screen.dart';
+import 'setup_screen.dart';
 
 class EditorScreen extends StatefulWidget {
   const EditorScreen({super.key});
@@ -28,8 +31,17 @@ class _EditorScreenState extends State<EditorScreen> {
   String? _statusMessage;
   Color _statusColor = Colors.blue.shade700;
   IconData _statusIcon = Icons.info_outline;
-  bool _serverBusy = false;
-  final _serverCtrl = TextEditingController();
+
+  // Авто-закрытие редактора, если оператор оставил его открытым без действий.
+  static const Duration _inactivityTimeout = Duration(seconds: 30);
+  Timer? _inactivityTimer;
+
+  // Периодическое обновление таймлайна (времена слотов / текущий элемент).
+  Timer? _timelineTimer;
+
+  // Превью (миниатюры) для таймлайна: онлайн — по mediaId, оффлайн — по имени файла.
+  final Map<int, String> _previewByMediaId = {};
+  final Map<String, String> _previewByFilename = {};
 
   late final PlaylistController _controller;
 
@@ -37,7 +49,6 @@ class _EditorScreenState extends State<EditorScreen> {
   void initState() {
     super.initState();
     _controller = Get.find<PlaylistController>();
-    _serverCtrl.text = _controller.serverAddress;
 
     _offlineModeWorker = ever<bool>(_controller.isOfflineMode, (mode) {
       setState(() {
@@ -48,15 +59,50 @@ class _EditorScreenState extends State<EditorScreen> {
 
     _isOfflineMode = _controller.isOfflineMode.value;
     _loadPlaylist();
+    _resetInactivityTimer();
+    _timelineTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted) return;
+      setState(() {});
+      unawaited(_resolvePreviews());
+    });
   }
 
   @override
   void dispose() {
     _offlineModeWorker?.dispose();
     _statusTimer?.cancel();
+    _inactivityTimer?.cancel();
+    _timelineTimer?.cancel();
     _scrollController.dispose();
-    _serverCtrl.dispose();
     super.dispose();
+  }
+
+  /// Перезапускает таймер бездействия. Вызывается при любом действии оператора.
+  void _resetInactivityTimer() {
+    _inactivityTimer?.cancel();
+    _inactivityTimer = Timer(_inactivityTimeout, _onInactivityTimeout);
+  }
+
+  void _onInactivityTimeout() {
+    if (!mounted) return;
+    unawaited(AppLogger.log('Editor auto-closed: inactivity timeout'));
+    Get.back();
+  }
+
+  /// Открывает read-only диагностику. На время просмотра ставим таймер
+  /// бездействия редактора на паузу, по возврату — перезапускаем.
+  Future<void> _openStatus() async {
+    _inactivityTimer?.cancel();
+    await Get.to(() => const StatusScreen());
+    if (mounted) _resetInactivityTimer();
+  }
+
+  /// Настройки устройства (как первичная конфигурация, но без регистрации,
+  /// имя — read-only). На время — пауза авто-закрытия редактора.
+  Future<void> _openSettings() async {
+    _inactivityTimer?.cancel();
+    await Get.to(() => const SetupScreen(settingsMode: true));
+    if (mounted) _resetInactivityTimer();
   }
 
   Future<void> _loadPlaylist() async {
@@ -70,6 +116,57 @@ class _EditorScreenState extends State<EditorScreen> {
       _isLoading = false;
       _dirty = false;
     });
+    unawaited(_resolvePreviews());
+  }
+
+  /// Разрешает пути к закэшированным изображениям для миниатюр таймлайна
+  /// (видео получают плейсхолдер — извлечение кадра слишком тяжело для списка).
+  Future<void> _resolvePreviews() async {
+    var changed = false;
+    if (_isOfflineMode) {
+      final dir = await AppPaths.mediaDir();
+      for (final item in _items) {
+        if (!item.isImage || _previewByFilename.containsKey(item.filename)) {
+          continue;
+        }
+        final path = '${dir.path}/${item.baseName}';
+        if (await File(path).exists()) {
+          _previewByFilename[item.filename] = path;
+          changed = true;
+        }
+      }
+    } else {
+      final manifest = _controller.manifest;
+      if (manifest != null) {
+        final now = DateTime.now();
+        final mediaIds = <int>{};
+        for (final item in manifest.items.where(
+          (i) => i.endTime.isAfter(now),
+        )) {
+          if (item.contentType == ManifestContentType.media) {
+            mediaIds.add(item.contentId);
+          } else {
+            final pl = manifest.playlistById(item.contentId);
+            if (pl != null) {
+              for (final pi in pl.items) {
+                mediaIds.add(pi.mediaId);
+              }
+            }
+          }
+        }
+        for (final id in mediaIds) {
+          if (_previewByMediaId.containsKey(id)) continue;
+          final media = manifest.mediaById(id);
+          if (media == null || !media.isImage) continue;
+          final path = await _controller.cachedMediaPath(media);
+          if (path != null) {
+            _previewByMediaId[id] = path;
+            changed = true;
+          }
+        }
+      }
+    }
+    if (changed && mounted) setState(() {});
   }
 
   Future<void> _toggleOfflineMode(bool value) async {
@@ -131,40 +228,6 @@ class _EditorScreenState extends State<EditorScreen> {
     });
   }
 
-  Future<void> _changeServerOnline() async {
-    if (_serverBusy) return;
-    setState(() {
-      _serverBusy = true;
-    });
-    try {
-      final ok = await _controller.rebindServer(_serverCtrl.text);
-      if (!mounted) return;
-      if (ok) {
-        _showStatus(
-          _controller.setupMessage,
-          color: Colors.green.shade700,
-          icon: Icons.cloud_done_outlined,
-          duration: const Duration(seconds: 4),
-        );
-        if (!_controller.isReady) {
-          Get.back<void>();
-        }
-      }
-    } catch (e) {
-      _showStatus(
-        'Не удалось сменить сервер: $e',
-        color: Colors.red.shade700,
-        icon: Icons.error_outline,
-        duration: const Duration(seconds: 5),
-      );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _serverBusy = false;
-        });
-      }
-    }
-  }
 
   Future<void> _pickAndAddFiles() async {
     if (!_isOfflineMode) {
@@ -404,12 +467,25 @@ class _EditorScreenState extends State<EditorScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    // Любое действие (касание, прокрутка, клавиша/D-pad) сбрасывает таймер
+    // бездействия, по которому редактор сам закрывается и возвращает плеер.
+    return Focus(
+      canRequestFocus: false,
+      onKeyEvent: (_, __) {
+        _resetInactivityTimer();
+        return KeyEventResult.ignored;
+      },
+      child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (_) => _resetInactivityTimer(),
+        onPointerMove: (_) => _resetInactivityTimer(),
+        onPointerSignal: (_) => _resetInactivityTimer(),
+        child: Scaffold(
       backgroundColor: const Color(0xFFF5F5F5),
       appBar: AppBar(
         backgroundColor: Colors.white,
         elevation: 0,
-        title: const Text('Резервный плейлист'),
+        title: const Text('Воспроизведение'),
         actions: [
           if (_isOfflineMode && _dirty)
             IconButton(
@@ -417,6 +493,16 @@ class _EditorScreenState extends State<EditorScreen> {
               onPressed: _savePlaylist,
               tooltip: 'Сохранить плейлист',
             ),
+          IconButton(
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: _openSettings,
+            tooltip: 'Настройки устройства',
+          ),
+          IconButton(
+            icon: const Icon(Icons.monitor_heart_outlined),
+            onPressed: _openStatus,
+            tooltip: 'Диагностика устройства',
+          ),
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: _loadPlaylist,
@@ -427,7 +513,6 @@ class _EditorScreenState extends State<EditorScreen> {
       body: Column(
         children: [
           _buildModeBar(),
-          _buildServerSection(),
           if (_statusMessage != null) _buildStatusBanner(),
           Expanded(
             child: _isLoading
@@ -443,6 +528,8 @@ class _EditorScreenState extends State<EditorScreen> {
               onPressed: _pickAndAddFiles,
             )
           : null,
+        ),
+      ),
     );
   }
 
@@ -535,44 +622,6 @@ class _EditorScreenState extends State<EditorScreen> {
     );
   }
 
-  Widget _buildServerSection() {
-    return Container(
-      color: Colors.white,
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
-      child: Row(
-        children: [
-          Expanded(
-            child: TextField(
-              controller: _serverCtrl,
-              enabled: !_serverBusy,
-              decoration: const InputDecoration(
-                labelText: 'Адрес сервера',
-                border: OutlineInputBorder(),
-                isDense: true,
-                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          SizedBox(
-            height: 44,
-            child: FilledButton.icon(
-              onPressed: _serverBusy ? null : _changeServerOnline,
-              icon: _serverBusy
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.sync_alt),
-              label: const Text('Сменить'),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _buildStatusBanner() {
     return Container(
       width: double.infinity,
@@ -602,70 +651,168 @@ class _EditorScreenState extends State<EditorScreen> {
   }
 
   Widget _buildContent() {
-    if (!_isOfflineMode) {
-      return _buildOnlineModeView();
-    }
-    return _buildOfflineModeList();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _buildTimeline(),
+        Expanded(
+          child: _isOfflineMode ? _buildOfflineModeList() : _buildOnlineHint(),
+        ),
+      ],
+    );
   }
 
-  Widget _buildOnlineModeView() {
+  /// Горизонтальный таймлайн «что дальше воспроизводится».
+  /// Онлайн — слоты манифеста с временами; оффлайн — порядок локального плейлиста.
+  Widget _buildTimeline() {
+    final entries = _isOfflineMode
+        ? _offlineTimelineEntries()
+        : _onlineTimelineEntries();
+    final caption = _isOfflineMode
+        ? 'Резервный плейлист (по кругу)'
+        : 'Ревизия: ${_controller.manifest?.revision ?? '—'}';
+
+    return Container(
+      height: 210,
+      width: double.infinity,
+      color: Colors.white,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.timeline, size: 18, color: Color(0xFF1F2533)),
+              const SizedBox(width: 8),
+              const Text(
+                'Что дальше',
+                style: TextStyle(
+                  fontWeight: FontWeight.w700,
+                  fontSize: 15,
+                  color: Color(0xFF1F2533),
+                ),
+              ),
+              const Spacer(),
+              Flexible(
+                child: Text(
+                  caption,
+                  textAlign: TextAlign.right,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: entries.isEmpty
+                ? Center(
+                    child: Text(
+                      _isOfflineMode
+                          ? 'Резервный плейлист пуст'
+                          : 'Нет запланированного контента',
+                      style: TextStyle(color: Colors.grey.shade500),
+                    ),
+                  )
+                : ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: entries.length,
+                    separatorBuilder: (_, __) => const SizedBox(width: 10),
+                    itemBuilder: (context, i) =>
+                        _TimelineCard(entry: entries[i]),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<_TimelineEntry> _onlineTimelineEntries() {
+    final manifest = _controller.manifest;
+    if (manifest == null) return const [];
+    final now = DateTime.now();
+    final timeFmt = DateFormat('HH:mm');
+    final upcoming =
+        manifest.items.where((item) => item.endTime.isAfter(now)).toList()
+          ..sort((a, b) => a.startTime.compareTo(b.startTime));
+
+    return upcoming.take(20).map((item) {
+      final slotTime =
+          '${timeFmt.format(item.startTime)}–${timeFmt.format(item.endTime)}';
+      if (item.contentType == ManifestContentType.media) {
+        final media = manifest.mediaById(item.contentId);
+        final isVideo = media?.isVideo ?? false;
+        return _TimelineEntry(
+          title: media?.safeBaseName ?? 'Медиа #${item.contentId}',
+          icon: isVideo ? Icons.movie_outlined : Icons.image_outlined,
+          timeLabel: slotTime,
+          isCurrent: item.isActiveAt(now),
+          isVideo: isVideo,
+          previewPath: media != null ? _previewByMediaId[media.id] : null,
+        );
+      }
+      // Плейлист — раскрываем в широкий блок с вложенными элементами.
+      final playlist = manifest.playlistById(item.contentId);
+      final children = <_TimelineEntry>[];
+      if (playlist != null) {
+        for (final pi in playlist.items) {
+          final media = manifest.mediaById(pi.mediaId);
+          final isVideo = media?.isVideo ?? false;
+          children.add(
+            _TimelineEntry(
+              title: media?.safeBaseName ?? 'Медиа #${pi.mediaId}',
+              icon: isVideo ? Icons.movie_outlined : Icons.image_outlined,
+              timeLabel: '${pi.durationSec} c',
+              isCurrent: false,
+              isVideo: isVideo,
+              previewPath: media != null ? _previewByMediaId[media.id] : null,
+            ),
+          );
+        }
+      }
+      return _TimelineEntry(
+        title: (playlist?.name.isNotEmpty ?? false)
+            ? playlist!.name
+            : 'Плейлист #${item.contentId}',
+        icon: Icons.playlist_play,
+        timeLabel: slotTime,
+        isCurrent: item.isActiveAt(now),
+        children: children,
+      );
+    }).toList();
+  }
+
+  List<_TimelineEntry> _offlineTimelineEntries() {
+    return _items
+        .map(
+          (item) => _TimelineEntry(
+            title: item.baseName,
+            icon: item.isVideo ? Icons.movie_outlined : Icons.image_outlined,
+            timeLabel: item.isVideo ? 'видео' : '${item.durationSeconds} c',
+            isCurrent: false,
+            isVideo: item.isVideo,
+            previewPath: _previewByFilename[item.filename],
+          ),
+        )
+        .toList();
+  }
+
+  Widget _buildOnlineHint() {
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.cloud, size: 72, color: Colors.blue.shade200),
-          const SizedBox(height: 16),
+          Icon(Icons.cloud_done, size: 64, color: Colors.blue.shade200),
+          const SizedBox(height: 12),
           const Text(
             'Управление через сервер',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           Text(
-            'Ревизия: ${_controller.manifest?.revision ?? '—'}',
-            style: TextStyle(color: Colors.grey.shade600, fontSize: 15),
+            'Контент и расписание задаются в панели управления.',
+            style: TextStyle(color: Colors.grey.shade600),
           ),
-          const SizedBox(height: 24),
-          if (_items.isNotEmpty) ...[
-            Text(
-              'Текущие элементы (только просмотр):',
-              style: TextStyle(
-                color: Colors.grey.shade600,
-                fontSize: 13,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-            const SizedBox(height: 8),
-            SizedBox(
-              height: 200,
-              child: ListView.builder(
-                padding: const EdgeInsets.symmetric(horizontal: 24),
-                itemCount: _items.length,
-                itemBuilder: (context, i) {
-                  final item = _items[i];
-                  return Opacity(
-                    opacity: 0.55,
-                    child: Card(
-                      elevation: 0,
-                      margin: const EdgeInsets.symmetric(vertical: 3),
-                      child: ListTile(
-                        dense: true,
-                        leading: Icon(
-                          item.isVideo ? Icons.movie_outlined : Icons.image_outlined,
-                          size: 20,
-                          color: Colors.grey,
-                        ),
-                        title: Text(
-                          item.baseName,
-                          style: const TextStyle(fontSize: 13),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ),
-          ],
         ],
       ),
     );
@@ -1070,6 +1217,243 @@ class _DatePickerTile extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Запись таймлайна «что дальше воспроизводится».
+/// Если [children] не null — это плейлист, раскрываемый в широкий блок.
+class _TimelineEntry {
+  const _TimelineEntry({
+    required this.title,
+    required this.icon,
+    required this.timeLabel,
+    required this.isCurrent,
+    this.isVideo = false,
+    this.previewPath,
+    this.children,
+  });
+
+  final String title;
+  final IconData icon;
+  final String timeLabel;
+  final bool isCurrent;
+  final bool isVideo;
+  final String? previewPath;
+  final List<_TimelineEntry>? children;
+}
+
+const _accentColor = Color(0xFF3167E3);
+const _mutedColor = Color(0xFF5F6B84);
+const _borderColor = Color(0xFFD8DFEA);
+
+Widget _nowBadge() => Container(
+  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+  decoration: BoxDecoration(
+    color: _accentColor,
+    borderRadius: BorderRadius.circular(8),
+  ),
+  child: const Text(
+    'Сейчас',
+    style: TextStyle(
+      color: Colors.white,
+      fontSize: 10,
+      fontWeight: FontWeight.w700,
+    ),
+  ),
+);
+
+/// Миниатюра: реальное изображение из кэша или плейсхолдер с иконкой типа.
+Widget _timelineThumb(_TimelineEntry entry, {double radius = 8}) {
+  final placeholder = Container(
+    color: const Color(0xFFEFF2F7),
+    alignment: Alignment.center,
+    child: Icon(entry.icon, color: const Color(0xFF9AA7BD)),
+  );
+  Widget inner = placeholder;
+  if (entry.previewPath != null) {
+    inner = Image.file(
+      File(entry.previewPath!),
+      fit: BoxFit.cover,
+      errorBuilder: (_, __, ___) => placeholder,
+    );
+  }
+  return ClipRRect(
+    borderRadius: BorderRadius.circular(radius),
+    child: SizedBox.expand(child: inner),
+  );
+}
+
+class _TimelineCard extends StatelessWidget {
+  const _TimelineCard({required this.entry});
+
+  final _TimelineEntry entry;
+
+  @override
+  Widget build(BuildContext context) {
+    if (entry.children != null) {
+      return _PlaylistTimelineCard(entry: entry);
+    }
+    final accent = entry.isCurrent ? _accentColor : _borderColor;
+    return Container(
+      width: 150,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: entry.isCurrent ? const Color(0xFFF4F8FF) : Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: accent, width: entry.isCurrent ? 2 : 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                _timelineThumb(entry),
+                if (entry.isCurrent)
+                  Positioned(top: 6, left: 6, child: _nowBadge()),
+                if (entry.isVideo)
+                  const Positioned(
+                    right: 6,
+                    bottom: 6,
+                    child: Icon(
+                      Icons.play_circle_fill,
+                      color: Colors.white,
+                      size: 22,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            entry.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontWeight: FontWeight.w600,
+              fontSize: 13,
+              color: Color(0xFF1F2533),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            entry.timeLabel,
+            style: const TextStyle(fontSize: 12, color: _mutedColor),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Широкий блок плейлиста: имя слота + горизонтальная лента вложенных элементов.
+class _PlaylistTimelineCard extends StatelessWidget {
+  const _PlaylistTimelineCard({required this.entry});
+
+  final _TimelineEntry entry;
+
+  @override
+  Widget build(BuildContext context) {
+    final children = entry.children ?? const <_TimelineEntry>[];
+    final accent = entry.isCurrent ? _accentColor : _borderColor;
+
+    return Container(
+      width: 320,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: entry.isCurrent ? const Color(0xFFF4F8FF) : Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: accent, width: entry.isCurrent ? 2 : 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.playlist_play,
+                size: 18,
+                color: entry.isCurrent ? _accentColor : _mutedColor,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  entry.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                    color: Color(0xFF1F2533),
+                  ),
+                ),
+              ),
+              if (entry.isCurrent) _nowBadge(),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${entry.timeLabel} · ${children.length} элем.',
+            style: const TextStyle(fontSize: 12, color: _mutedColor),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: children.isEmpty
+                ? const SizedBox.shrink()
+                : ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: children.length,
+                    separatorBuilder: (_, __) => const SizedBox(width: 6),
+                    itemBuilder: (_, i) => _PlaylistMini(entry: children[i]),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PlaylistMini extends StatelessWidget {
+  const _PlaylistMini({required this.entry});
+
+  final _TimelineEntry entry;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 56,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                _timelineThumb(entry, radius: 6),
+                if (entry.isVideo)
+                  const Positioned(
+                    right: 2,
+                    bottom: 2,
+                    child: Icon(
+                      Icons.play_circle_fill,
+                      color: Colors.white,
+                      size: 14,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            entry.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 9, color: _mutedColor),
+          ),
+        ],
       ),
     );
   }

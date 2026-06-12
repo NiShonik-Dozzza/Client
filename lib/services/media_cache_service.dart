@@ -145,6 +145,16 @@ class MediaCacheService {
     });
   }
 
+  /// Возвращает уже закэшированный файл медиа без скачивания (для превью).
+  /// null — если файла нет на диске или mediaRoot пуст.
+  Future<File?> cachedFile(ManifestMedia media, String mediaRoot) async {
+    if (mediaRoot.trim().isEmpty) return null;
+    final file = File(
+      p.join(mediaRoot, 'media_${media.id}_${media.safeBaseName}'),
+    );
+    return await file.exists() ? file : null;
+  }
+
   Future<File> _targetFile(ManifestMedia media, String mediaRoot) async {
     final dir = Directory(mediaRoot);
     if (!await dir.exists()) {
