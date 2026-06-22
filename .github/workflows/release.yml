@@ -126,18 +126,23 @@ jobs:
             echo "No keystore secrets found — will use debug signing."
           fi
 
-      - name: Build APK (arm64 — для большинства устройств и Android TV)
+      # Сплит по ABI: arm64-v8a — для современных устройств,
+      # armeabi-v7a — для 32-битных SmartTV/Android TV (железо ARMv8-A,
+      # но система прошита 32-битной → ставится только v7a).
+      - name: Build APK (split per ABI — arm64 + armv7)
         run: |
           flutter build apk --release \
-            --target-platform android-arm64 \
+            --target-platform android-arm,android-arm64 \
             --split-per-abi
 
-      - name: Rename APK with version
+      - name: Rename APKs with version
         run: |
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"   # убираем 'v' из тега
           mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
              build/app/outputs/flutter-apk/efir-${VERSION}-android-arm64.apk
+          mv build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk \
+             build/app/outputs/flutter-apk/efir-${VERSION}-android-armv7.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -177,4 +182,5 @@ jobs:
             |---|---|---|
             | Windows 10/11 | `efir-setup-*-windows-x64.exe` | Запустить от администратора |
             | Linux (любой дистрибутив) | `efir-client_*_linux_amd64.tar.gz` | `tar xzf *.tar.gz && sudo ./*linux*/install.sh kiosk` |
-            | Android / Android TV | `efir-*-android-arm64.apk` | `adb install -r *.apk` |
+            | Android / Android TV (64-бит) | `efir-*-android-arm64.apk` | `adb install -r *.apk` |
+            | Android TV (32-бит, старые/дешёвые SmartTV) | `efir-*-android-armv7.apk` | `adb install -r *.apk` |
