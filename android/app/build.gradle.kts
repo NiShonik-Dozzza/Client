@@ -52,10 +52,27 @@ android {
 
     buildTypes {
         release {
+            // Без key.properties release-сборка падает (см. tasks.configureEach ниже):
+            // debug-подписанный «релиз» нельзя ни распространять, ни обновить поверх.
             signingConfig = if (keyPropertiesFile.exists())
                 signingConfigs.getByName("release")
             else
-                signingConfigs.getByName("debug")  // fallback для локальной разработки
+                null
+        }
+    }
+}
+
+// Fail-fast на этапе задачи (не конфигурации — иначе сломались бы и debug-сборки).
+tasks.configureEach {
+    if ((name.startsWith("assemble") || name.startsWith("bundle")) &&
+        name.contains("Release") && !keyPropertiesFile.exists()
+    ) {
+        doFirst {
+            throw GradleException(
+                "android/key.properties не найден: release-сборке нужен release-keystore. " +
+                    "Скопируйте android/key.properties.example → key.properties и заполните " +
+                    "(в CI файл создаётся из GitHub Secrets)."
+            )
         }
     }
 }

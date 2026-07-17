@@ -71,6 +71,10 @@ flutter build windows --release   # или: flutter build linux --release / flut
 
 Релиз: создать тег `vX.Y.Z` и запушить — GitHub Actions соберёт Windows-инсталлятор, Linux tar.gz и APK (для APK нужны секреты подписи, см. `android/key.properties.example`).
 
+Локальная release-сборка APK требует `android/key.properties` с release-keystore —
+без него сборка падает (fallback на debug-подпись убран сознательно: debug-подписанный
+«релиз» нельзя распространять и обновлять поверх).
+
 ## Архитектура (кратко)
 
 `lib/controllers/playlist_controller.dart` — состояние устройства: регистрация, манифест-полл, heartbeat, кэш, хранилище. `lib/views/` — плеер (двойной видеоплеер media_kit/mpv для бесшовных переходов), экран настройки, сервисный редактор, диагностика. `lib/services/` — API, кэш медиа, конфиг, хранилище, логи. Планы — [ROADMAP.md](ROADMAP.md).
