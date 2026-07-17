@@ -79,12 +79,27 @@ class DeviceStore {
     await _protectDeviceFile(file);
   }
 
+  /// Best-effort сужение прав на файл с токеном: только текущий пользователь
+  /// (плюс SYSTEM на Windows). Сбой — не фатален (kiosk-сборки под
+  /// нестандартными аккаунтами не должны падать из-за ACL).
   Future<void> _protectDeviceFile(File file) async {
-    if (!(Platform.isLinux || Platform.isMacOS)) return;
     try {
-      await Process.run('chmod', ['600', file.path]);
+      if (Platform.isLinux || Platform.isMacOS) {
+        await Process.run('chmod', ['600', file.path]);
+      } else if (Platform.isWindows) {
+        final user = Platform.environment['USERNAME'];
+        if (user == null || user.isEmpty) return;
+        await Process.run('icacls', [
+          file.path,
+          '/inheritance:r',
+          '/grant:r',
+          '$user:F',
+          '/grant:r',
+          'SYSTEM:F',
+        ]);
+      }
     } catch (e) {
-      await AppLogger.log('DeviceStore chmod warning: $e');
+      await AppLogger.log('DeviceStore file protect warning: $e');
     }
   }
 }

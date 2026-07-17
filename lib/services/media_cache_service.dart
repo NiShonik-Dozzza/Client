@@ -172,6 +172,16 @@ class MediaCacheService {
   }) async {
     if (!await file.exists()) return false;
 
+    if (media.sha256.isEmpty) {
+      // Сервер всегда присылает sha256 (NOT NULL в БД). Пустое значение —
+      // повреждённый/подделанный манифест: без хеша целостность не проверить.
+      // Проверка ДО индекса: старые записи индекса без хеша тоже не считаются валидными.
+      await AppLogger.log(
+        'media ${media.id}: manifest has no sha256 — rejecting (integrity check required)',
+      );
+      return false;
+    }
+
     final stat = await file.stat();
     if (media.size > 0 && stat.size != media.size) return false;
 
@@ -181,10 +191,6 @@ class MediaCacheService {
       return true;
     }
 
-    if (media.sha256.isEmpty) {
-      await _rememberValid(file, media, stat);
-      return true;
-    }
     if (!verifyHashWhenUncached) return true;
 
     final digest = await sha256.bind(file.openRead()).first;
