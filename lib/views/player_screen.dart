@@ -625,13 +625,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<bool> _checkPinIfRequired() async {
-    final pin = Get.find<PlaylistController>().servicePin;
-    if (pin.isEmpty) return true;
+    final controller = Get.find<PlaylistController>();
+    if (!controller.hasServicePin) return true;
     final entered = await Get.dialog<String>(
       const _PinDialog(),
       barrierDismissible: false,
     );
-    return entered == pin;
+    return controller.verifyServicePin(entered ?? '');
   }
 
   // ===== ДОБАВЛЕНО: методы для работы с редактором =====

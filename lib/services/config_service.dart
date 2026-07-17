@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:math';
+import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'app_paths.dart';
 import 'app_logger.dart';
@@ -8,15 +10,21 @@ class AppConfig {
   final String serverUrl;
   final String selectedDisplayId;
   final int displayRotation;
-  final String servicePin;
+
+  /// PIN хранится только как `sha256:<salt-hex>:<hash-hex>`, не в открытом виде.
+  /// Это защита от случайного чтения config.json, а не криптостойкое хранение:
+  /// короткий цифровой PIN подбирается оффлайн, но гейт здесь — физический доступ.
+  final String servicePinHash;
 
   AppConfig({
     required this.mediaRoot,
     required this.serverUrl,
     required this.selectedDisplayId,
     required this.displayRotation,
-    this.servicePin = '',
+    this.servicePinHash = '',
   });
+
+  bool get hasServicePin => servicePinHash.isNotEmpty;
 
   String get apiBase {
     if (serverUrl.isEmpty) return '';
@@ -29,7 +37,7 @@ class AppConfig {
     if (selectedDisplayId.isNotEmpty) 'selected_display_id': selectedDisplayId,
     'display_rotation': displayRotation,
     if (serverUrl.isNotEmpty) 'api_base': apiBase,
-    if (servicePin.isNotEmpty) 'service_pin': servicePin,
+    if (servicePinHash.isNotEmpty) 'service_pin_hash': servicePinHash,
   };
 
   static AppConfig defaults(String docsMediaDir) {
@@ -72,7 +80,12 @@ class ConfigService {
       final displayRotation = _normalizeRotation(
         _asInt(map['display_rotation']),
       );
-      final servicePin = (map['service_pin'] as String?)?.trim() ?? '';
+      var servicePinHash = (map['service_pin_hash'] as String?)?.trim() ?? '';
+      final legacyPlaintextPin = (map['service_pin'] as String?)?.trim() ?? '';
+      final migratedPin = servicePinHash.isEmpty && legacyPlaintextPin.isNotEmpty;
+      if (migratedPin) {
+        servicePinHash = hashServicePin(legacyPlaintextPin);
+      }
       final cfg = AppConfig(
         mediaRoot: (mediaRoot == null || mediaRoot.isEmpty)
             ? defaultConfig.mediaRoot
@@ -80,9 +93,14 @@ class ConfigService {
         serverUrl: serverUrl,
         selectedDisplayId: selectedDisplayId,
         displayRotation: displayRotation,
-        servicePin: servicePin,
+        servicePinHash: servicePinHash,
       );
       _cached = cfg;
+      if (migratedPin || map.containsKey('service_pin')) {
+        // Немедленно перезаписываем config без plaintext-ключа service_pin.
+        await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
+        await AppLogger.log('Config: service pin migrated to hashed storage');
+      }
       await AppLogger.log(
         'Config loaded: media_root=${cfg.mediaRoot} server_url=${cfg.serverUrl} api_base=${cfg.apiBase}',
       );
@@ -102,7 +120,7 @@ class ConfigService {
       serverUrl: current.serverUrl,
       selectedDisplayId: current.selectedDisplayId,
       displayRotation: current.displayRotation,
-      servicePin: current.servicePin,
+      servicePinHash: current.servicePinHash,
     );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
@@ -117,7 +135,7 @@ class ConfigService {
       serverUrl: normalized,
       selectedDisplayId: _cached?.selectedDisplayId ?? '',
       displayRotation: _cached?.displayRotation ?? 0,
-      servicePin: _cached?.servicePin ?? '',
+      servicePinHash: _cached?.servicePinHash ?? '',
     );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
@@ -131,16 +149,23 @@ class ConfigService {
   Future<void> setServicePin(String pin) async {
     final file = await AppPaths.configFile();
     final current = _cached ?? await load();
+    final trimmed = pin.trim();
     final cfg = AppConfig(
       mediaRoot: current.mediaRoot,
       serverUrl: current.serverUrl,
       selectedDisplayId: current.selectedDisplayId,
       displayRotation: current.displayRotation,
-      servicePin: pin.trim(),
+      servicePinHash: trimmed.isEmpty ? '' : hashServicePin(trimmed),
     );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
-    await AppLogger.log('Config updated: service_pin=${pin.isEmpty ? "cleared" : "set"}');
+    await AppLogger.log('Config updated: service_pin=${trimmed.isEmpty ? "cleared" : "set"}');
+  }
+
+  bool verifyServicePin(String entered) {
+    final stored = _cached?.servicePinHash ?? '';
+    if (stored.isEmpty) return true;
+    return verifyServicePinHash(stored, entered.trim());
   }
 
   Future<void> setDisplayPreferences({
@@ -157,7 +182,7 @@ class ConfigService {
       displayRotation: _normalizeRotation(
         displayRotation ?? current.displayRotation,
       ),
-      servicePin: current.servicePin,
+      servicePinHash: current.servicePinHash,
     );
     await file.writeAsString(jsonEncode(cfg.toJson()), flush: true);
     _cached = cfg;
@@ -169,6 +194,31 @@ class ConfigService {
   static String joinMedia(String mediaRoot, String filename) {
     return p.join(mediaRoot, p.basename(filename));
   }
+}
+
+final _pinSaltRandom = Random.secure();
+
+/// `sha256:<salt-hex>:<hash-hex>`, где hash = sha256(utf8(saltHex + pin)).
+String hashServicePin(String pin) {
+  final saltHex = List<int>.generate(16, (_) => _pinSaltRandom.nextInt(256))
+      .map((b) => b.toRadixString(16).padLeft(2, '0'))
+      .join();
+  final digest = sha256.convert(utf8.encode(saltHex + pin));
+  return 'sha256:$saltHex:$digest';
+}
+
+bool verifyServicePinHash(String stored, String entered) {
+  final parts = stored.split(':');
+  if (parts.length != 3 || parts[0] != 'sha256') return false;
+  final expected = parts[2].toLowerCase();
+  final actual = sha256.convert(utf8.encode(parts[1] + entered)).toString();
+  // Сравнение без раннего выхода (константное по времени для равных длин).
+  if (expected.length != actual.length) return false;
+  var diff = 0;
+  for (var i = 0; i < expected.length; i++) {
+    diff |= expected.codeUnitAt(i) ^ actual.codeUnitAt(i);
+  }
+  return diff == 0;
 }
 
 String _extractServerUrl(String? serverUrl, String? apiBase) {

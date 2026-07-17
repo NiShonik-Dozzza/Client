@@ -41,6 +41,22 @@ class TlsTrustPrompt {
       TrustStore.displayFingerprint(fingerprintHex);
 }
 
+/// Ожидающее подтверждения использование незашифрованного HTTP: сервер
+/// доступен только по cleartext, оператор должен явно согласиться.
+class CleartextHttpPrompt {
+  const CleartextHttpPrompt({required this.host, required this.port});
+
+  final String host;
+  final int port;
+}
+
+/// Резолв адреса остановлен: выбранный кандидат — незашифрованный HTTP,
+/// а согласия оператора ещё нет (см. [PlaylistController.pendingCleartextPrompt]).
+class CleartextHttpPendingError implements Exception {
+  @override
+  String toString() => 'CleartextHttpPendingError';
+}
+
 class PlaylistController extends GetxController {
   String _clientVersion = 'efir-client';
 
@@ -52,6 +68,15 @@ class PlaylistController extends GetxController {
 
   /// Ожидающее подтверждения TLS-доверие (заполняется при ошибке сертификата).
   final Rxn<TlsTrustPrompt> pendingTlsPrompt = Rxn<TlsTrustPrompt>();
+
+  /// Ожидающее подтверждения использование cleartext HTTP.
+  final Rxn<CleartextHttpPrompt> pendingCleartextPrompt =
+      Rxn<CleartextHttpPrompt>();
+
+  /// Разовые согласия оператора на HTTP в рамках сессии (host:port).
+  /// После успешного резолва база сохраняется с явным `http://` —
+  /// дальше согласие несёт сама сохранённая схема.
+  final Set<String> _cleartextConsents = <String>{};
 
   // Место хранения контента (медиа-кэш) и рантайм-диагностика носителя.
   final RxString storageLocation = ''.obs;
@@ -142,7 +167,8 @@ class PlaylistController extends GetxController {
   String get currentRevision => _manifest?.revision ?? '';
   List<ManifestItem> get items => _manifest?.items ?? [];
   List<PlaylistItem> get editorItems => localItems.toList();
-  String get servicePin => _config.cached?.servicePin ?? '';
+  bool get hasServicePin => _config.cached?.hasServicePin ?? false;
+  bool verifyServicePin(String entered) => _config.verifyServicePin(entered);
   String get clientVersion => _clientVersion;
   String get mediaRoot => _mediaRoot;
   String get configuredStorage => _config.cached?.mediaRoot ?? '';
@@ -356,9 +382,11 @@ class PlaylistController extends GetxController {
       }
     }
 
-    final normalizedServer = _normalizeServerAddress(
-      serverAddress ?? _serverAddress.value,
-    );
+    final rawInput = (serverAddress ?? _serverAddress.value).trim();
+    // Явный ввод `http://` — намерение оператора, диалог согласия не нужен.
+    // Схему смотрим ДО нормализации: она сама подставляет http:// к голому хосту.
+    final explicitHttp = rawInput.toLowerCase().startsWith('http://');
+    final normalizedServer = _normalizeServerAddress(rawInput);
     if (normalizedServer.isEmpty) {
       showMessage('Введите IP-адрес или доменное имя сервера.');
       return false;
@@ -368,6 +396,7 @@ class PlaylistController extends GetxController {
     try {
       final (resolvedServer, health) = await _resolveServerBaseWithHealth(
         normalizedServer,
+        allowInsecureHttp: explicitHttp,
       );
       _serverAddress.value = resolvedServer;
       if (deviceName != null && deviceName.trim().isNotEmpty) {
@@ -404,7 +433,9 @@ class PlaylistController extends GetxController {
     final api = _api;
     if (auth == null || api == null) return false;
 
-    final normalizedServer = _normalizeServerAddress(serverAddress);
+    final rawInput = serverAddress.trim();
+    final explicitHttp = rawInput.toLowerCase().startsWith('http://');
+    final normalizedServer = _normalizeServerAddress(rawInput);
     if (normalizedServer.isEmpty) {
       _setSetupRequired('Введите IP-адрес или доменное имя сервера.');
       return false;
@@ -414,6 +445,7 @@ class PlaylistController extends GetxController {
     try {
       final (resolvedServer, health) = await _resolveServerBaseWithHealth(
         normalizedServer,
+        allowInsecureHttp: explicitHttp,
       );
       _serverAddress.value = resolvedServer;
       _deviceDisplayName.value = deviceName.trim().isNotEmpty
@@ -993,7 +1025,12 @@ class PlaylistController extends GetxController {
     }
 
     try {
-      final (resolvedServer, _) = await _resolveServerBaseWithHealth(current);
+      // Сохранённая база уже имеет явную схему http:// (согласие оператора либо
+      // его явный ввод) — фоновая перепроверка не должна показывать диалог.
+      final (resolvedServer, _) = await _resolveServerBaseWithHealth(
+        current,
+        allowInsecureHttp: true,
+      );
       if (resolvedServer == current) {
         return;
       }
@@ -1009,8 +1046,9 @@ class PlaylistController extends GetxController {
   }
 
   Future<(String, DeviceHealth)> _resolveServerBaseWithHealth(
-    String raw,
-  ) async {
+    String raw, {
+    bool allowInsecureHttp = false,
+  }) async {
     final normalized = _normalizeServerAddress(raw);
     if (normalized.isEmpty) {
       throw StateError('server address is empty');
@@ -1021,7 +1059,24 @@ class PlaylistController extends GetxController {
     for (final candidate in _serverCandidates(normalized)) {
       try {
         final health = await ApiService(serverBase: candidate).health();
+        final uri = Uri.parse(candidate);
+        if (uri.scheme == 'http' &&
+            !allowInsecureHttp &&
+            !_cleartextConsents.contains(_hostPortKey(uri))) {
+          // Сервер отвечает только по cleartext: токен и медиа пойдут открытым
+          // текстом. Не коммитим адрес без явного согласия оператора.
+          pendingCleartextPrompt.value = CleartextHttpPrompt(
+            host: uri.host,
+            port: uri.hasPort ? uri.port : 80,
+          );
+          await AppLogger.log(
+            'cleartext HTTP prompt: ${uri.host}:${uri.hasPort ? uri.port : 80}',
+          );
+          throw CleartextHttpPendingError();
+        }
         return (candidate, health);
+      } on CleartextHttpPendingError {
+        rethrow;
       } catch (e, st) {
         lastError = e;
         lastStackTrace = st;
@@ -1033,6 +1088,19 @@ class PlaylistController extends GetxController {
     }
     throw StateError('No server candidates to probe');
   }
+
+  static String _hostPortKey(Uri uri) =>
+      '${uri.host}:${uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 80)}';
+
+  /// Согласие оператора на cleartext HTTP: запомнить и забыть prompt.
+  void acceptPendingCleartextHttp() {
+    final prompt = pendingCleartextPrompt.value;
+    if (prompt == null) return;
+    _cleartextConsents.add('${prompt.host}:${prompt.port}');
+    pendingCleartextPrompt.value = null;
+  }
+
+  void dismissCleartextPrompt() => pendingCleartextPrompt.value = null;
 
   /// Кандидаты для проб health при резолве адреса сервера.
   ///
@@ -1146,6 +1214,9 @@ class PlaylistController extends GetxController {
 
   /// Человекочитаемая причина сетевой ошибки для setup-сообщений.
   String _describeServerError(Object e) {
+    if (e is CleartextHttpPendingError) {
+      return 'сервер доступен только по незащищённому HTTP — требуется подтверждение';
+    }
     if (e is TimeoutException) return 'сервер не ответил вовремя';
     if (e is TlsException) return 'ошибка TLS-сертификата сервера';
     if (e is SocketException) {
@@ -1252,7 +1323,9 @@ class PlaylistController extends GetxController {
   }
 
   Future<bool> rebindServer(String rawServerAddress) async {
-    final normalizedServer = _normalizeServerAddress(rawServerAddress);
+    final rawInput = rawServerAddress.trim();
+    final explicitHttp = rawInput.toLowerCase().startsWith('http://');
+    final normalizedServer = _normalizeServerAddress(rawInput);
     if (normalizedServer.isEmpty) {
       _setSetupRequired('Введите адрес сервера.');
       return false;
@@ -1262,6 +1335,7 @@ class PlaylistController extends GetxController {
     try {
       final (resolvedServer, _) = await _resolveServerBaseWithHealth(
         normalizedServer,
+        allowInsecureHttp: explicitHttp,
       );
       final current = _normalizeServerAddress(_serverAddress.value);
       _serverAddress.value = resolvedServer;

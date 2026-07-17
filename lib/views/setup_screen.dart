@@ -31,7 +31,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _nameController = TextEditingController(
       text: _controller.deviceDisplayName,
     );
-    _pinController = TextEditingController(text: _controller.servicePin);
+    // PIN хранится только хешем — предзаполнить поле нечем (и незачем).
+    _pinController = TextEditingController();
   }
 
   @override
@@ -57,7 +58,10 @@ class _SetupScreenState extends State<SetupScreen> {
       deviceName: _nameController.text,
       keepStage: widget.settingsMode,
     );
-    if (!ok) await _maybeAskTlsTrust(retry: _checkConnection);
+    if (!ok) {
+      await _maybeAskTlsTrust(retry: _checkConnection);
+      await _maybeAskCleartextConsent(retry: _checkConnection);
+    }
   }
 
   Future<void> _submitRequest() async {
@@ -65,7 +69,68 @@ class _SetupScreenState extends State<SetupScreen> {
       serverAddress: _serverController.text,
       deviceName: _nameController.text,
     );
-    if (!ok) await _maybeAskTlsTrust(retry: _submitRequest);
+    if (!ok) {
+      await _maybeAskTlsTrust(retry: _submitRequest);
+      await _maybeAskCleartextConsent(retry: _submitRequest);
+    }
+  }
+
+  /// Сервер доступен только по незашифрованному HTTP: предупредить оператора
+  /// и продолжить лишь после явного согласия.
+  Future<void> _maybeAskCleartextConsent({
+    required Future<void> Function() retry,
+  }) async {
+    final prompt = _controller.pendingCleartextPrompt.value;
+    if (prompt == null || !mounted) return;
+    final accepted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.lock_open_outlined, size: 22),
+            SizedBox(width: 8),
+            Expanded(child: Text('Незащищённое соединение')),
+          ],
+        ),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Сервер ${prompt.host}:${prompt.port} доступен только по '
+                'обычному HTTP без шифрования.',
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Токен устройства и медиафайлы будут передаваться открытым '
+                'текстом — их сможет перехватить любой в этой сети. '
+                'Используйте HTTP только в доверенной локальной сети.',
+                style: TextStyle(color: Colors.grey),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Использовать HTTP'),
+          ),
+        ],
+      ),
+    );
+    if (accepted == true) {
+      _controller.acceptPendingCleartextHttp();
+      await retry();
+    } else {
+      _controller.dismissCleartextPrompt();
+    }
   }
 
   /// Сервер с самоподписанным сертификатом: показать отпечаток и спросить
@@ -427,6 +492,7 @@ class _SetupScreenState extends State<SetupScreen> {
                           _PinSetupCard(
                             controller: _pinController,
                             saved: _pinSaved,
+                            hasPin: _controller.hasServicePin,
                             onSave: _savePin,
                           ),
                         ],
@@ -672,11 +738,13 @@ class _PinSetupCard extends StatefulWidget {
   const _PinSetupCard({
     required this.controller,
     required this.saved,
+    required this.hasPin,
     required this.onSave,
   });
 
   final TextEditingController controller;
   final bool saved;
+  final bool hasPin;
   final VoidCallback onSave;
 
   @override
@@ -733,7 +801,12 @@ class _PinSetupCardState extends State<_PinSetupCard> {
             keyboardType: TextInputType.number,
             decoration: InputDecoration(
               labelText: 'PIN-код',
-              hintText: 'Например: 1234',
+              hintText: widget.hasPin
+                  ? 'PIN установлен — введите новый, чтобы заменить'
+                  : 'Например: 1234',
+              helperText: widget.hasPin
+                  ? 'Чтобы отключить защиту, сохраните пустое поле'
+                  : null,
               border: const OutlineInputBorder(),
               suffixIcon: IconButton(
                 icon: Icon(_obscure ? Icons.visibility_off : Icons.visibility),
