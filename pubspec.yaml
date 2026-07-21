@@ -51,6 +51,7 @@ dependencies:
   intl: ^0.20.2
   screen_retriever: ^0.2.0
   package_info_plus: ^10.1.0 # фактическая версия задаётся dependency_overrides (локальный путь)
+  cryptography: ^2.9.0
 
 dev_dependencies:
   flutter_test:

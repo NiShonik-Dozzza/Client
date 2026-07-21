@@ -20,6 +20,7 @@ import '../services/manifest_store.dart';
 import '../services/media_cache_service.dart';
 import '../services/storage_service.dart';
 import '../services/trust_store.dart';
+import '../services/update_service.dart';
 
 enum DeviceSetupStage { booting, setupRequired, pendingApproval, ready }
 
@@ -59,6 +60,10 @@ class CleartextHttpPendingError implements Exception {
 
 class PlaylistController extends GetxController {
   String _clientVersion = 'efir-client';
+  // Чистые version/build отдельно от витринной строки: панель сравнивает их
+  // с релизом, и "efir-client 1.0.0+1" туда отправлять нельзя.
+  String _appVersion = '';
+  int _appBuild = 0;
 
   // Диагностика устройства для status screen.
   final Rxn<DateTime> lastHeartbeatAt = Rxn<DateTime>();
@@ -927,6 +932,8 @@ class PlaylistController extends GetxController {
     try {
       final info = await PackageInfo.fromPlatform();
       _clientVersion = 'efir-client ${info.version}+${info.buildNumber}';
+      _appVersion = info.version;
+      _appBuild = int.tryParse(info.buildNumber) ?? 0;
     } catch (e) {
       await AppLogger.log('client version load failed: $e');
     }
@@ -956,7 +963,10 @@ class PlaylistController extends GetxController {
         deviceId: auth.deviceId,
         currentRevision: currentRevision,
         nowPlaying: _nowPlaying,
-        clientVersion: _clientVersion,
+        clientVersion: _appVersion.isNotEmpty ? _appVersion : _clientVersion,
+        clientBuild: _appBuild,
+        platform: UpdateService.platform,
+        arch: UpdateService.arch,
         networkState: _manifestFailures == 0 ? 'online' : 'degraded',
         cachedMediaCount: cacheDiagnostics.cachedMediaCount,
         cacheSizeBytes: cacheDiagnostics.cacheSizeBytes,
