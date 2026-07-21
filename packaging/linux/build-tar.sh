@@ -42,6 +42,10 @@ chmod 755 "$STAGING/efir"
 cp "$SCRIPT_DIR/install.sh" "$STAGING/"
 chmod 755 "$STAGING/install.sh"
 
+# Версия внутри архива: её читает и install.sh, и автообновление — по имени
+# каталога определять ненадёжно, оно зависит от того, как распаковали.
+echo "$VERSION" > "$STAGING/VERSION"
+
 # --- Упаковка ---
 mkdir -p "$OUTPUT_DIR"
 tar -czf "$OUTPUT_DIR/${PKG_NAME}.tar.gz" \

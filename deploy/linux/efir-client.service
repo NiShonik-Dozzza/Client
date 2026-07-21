@@ -8,8 +8,10 @@ Wants=graphical-session.target network-online.target
 [Service]
 Type=simple
 
-# Путь к бинарнику — замените перед установкой
-ExecStart=/opt/efir-client/efir
+# Путь к бинарнику — замените перед установкой.
+# Через симлинк current, а не через конкретную версию: обновление из панели
+# переставляет его, и systemd поднимает новую сборку без правки юнита.
+ExecStart=/opt/efir-client/current/efir
 
 # Перезапускать при любом завершении (crash, clean exit, SIGTERM)
 Restart=always

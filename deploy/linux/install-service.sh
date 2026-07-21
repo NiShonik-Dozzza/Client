@@ -12,7 +12,8 @@
 
 set -euo pipefail
 
-APP_BINARY="${1:-/opt/efir-client/efir}"
+# Симлинк current, а не конкретная версия: его переставляет автообновление.
+APP_BINARY="${1:-/opt/efir-client/current/efir}"
 SERVICE_NAME="efir-client"
 SERVICE_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME.service"
