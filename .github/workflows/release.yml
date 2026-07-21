@@ -23,6 +23,21 @@ jobs:
           channel: stable
           cache: true
 
+      # Версия из тега попадает В БИНАРНИК, а не только в имя файла.
+      # Иначе клиент после обновления продолжит рапортовать старый build,
+      # панель сочтёт обновление неустановленным и будет ставить его по кругу.
+      - name: Resolve version and build number
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          IFS=. read -r MAJOR MINOR PATCH <<< "$VERSION"
+          # Монотонный versionCode: 1.2.3 -> 10203. Android не даст поставить
+          # сборку с меньшим значением, и это же число сравнивает панель.
+          BUILD=$(( MAJOR * 10000 + MINOR * 100 + PATCH ))
+          echo "EFIR_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "EFIR_BUILD=$BUILD"     >> "$GITHUB_ENV"
+          echo "version=$VERSION build=$BUILD"
+
       # Публичный ключ проверки обновлений вшивается в бинарь: только он решает,
       # принимать ли сборку, раздаваемую панелью. Переменная не задана —
       # клиент собирается с отключёнными обновлениями (fail-closed).
@@ -34,7 +49,11 @@ jobs:
           fi
 
       - name: Build Flutter Windows
-        run: flutter build windows --release --dart-define=EFIR_UPDATE_PUBLIC_KEY=${{ vars.EFIR_UPDATE_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          flutter build windows --release \
+            --build-name="$EFIR_VERSION" --build-number="$EFIR_BUILD" \
+            --dart-define=EFIR_UPDATE_PUBLIC_KEY=${{ vars.EFIR_UPDATE_PUBLIC_KEY }}
 
       - name: Download Inno Setup
         run: |
@@ -80,6 +99,21 @@ jobs:
           channel: stable
           cache: true
 
+      # Версия из тега попадает В БИНАРНИК, а не только в имя файла.
+      # Иначе клиент после обновления продолжит рапортовать старый build,
+      # панель сочтёт обновление неустановленным и будет ставить его по кругу.
+      - name: Resolve version and build number
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          IFS=. read -r MAJOR MINOR PATCH <<< "$VERSION"
+          # Монотонный versionCode: 1.2.3 -> 10203. Android не даст поставить
+          # сборку с меньшим значением, и это же число сравнивает панель.
+          BUILD=$(( MAJOR * 10000 + MINOR * 100 + PATCH ))
+          echo "EFIR_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "EFIR_BUILD=$BUILD"     >> "$GITHUB_ENV"
+          echo "version=$VERSION build=$BUILD"
+
       # Публичный ключ проверки обновлений вшивается в бинарь: только он решает,
       # принимать ли сборку, раздаваемую панелью. Переменная не задана —
       # клиент собирается с отключёнными обновлениями (fail-closed).
@@ -91,7 +125,10 @@ jobs:
           fi
 
       - name: Build Flutter Linux
-        run: flutter build linux --release --dart-define=EFIR_UPDATE_PUBLIC_KEY=${{ vars.EFIR_UPDATE_PUBLIC_KEY }}
+        run: |
+          flutter build linux --release \
+            --build-name="$EFIR_VERSION" --build-number="$EFIR_BUILD" \
+            --dart-define=EFIR_UPDATE_PUBLIC_KEY=${{ vars.EFIR_UPDATE_PUBLIC_KEY }}
 
       - name: Build tarball
         env:
@@ -123,6 +160,21 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+
+      # Версия из тега попадает В БИНАРНИК, а не только в имя файла.
+      # Иначе клиент после обновления продолжит рапортовать старый build,
+      # панель сочтёт обновление неустановленным и будет ставить его по кругу.
+      - name: Resolve version and build number
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          IFS=. read -r MAJOR MINOR PATCH <<< "$VERSION"
+          # Монотонный versionCode: 1.2.3 -> 10203. Android не даст поставить
+          # сборку с меньшим значением, и это же число сравнивает панель.
+          BUILD=$(( MAJOR * 10000 + MINOR * 100 + PATCH ))
+          echo "EFIR_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "EFIR_BUILD=$BUILD"     >> "$GITHUB_ENV"
+          echo "version=$VERSION build=$BUILD"
 
       # Публичный ключ проверки обновлений вшивается в бинарь: только он решает,
       # принимать ли сборку, раздаваемую панелью. Переменная не задана —
@@ -162,6 +214,7 @@ jobs:
       - name: Build APK (split per ABI — arm64 + armv7)
         run: |
           flutter build apk --release \
+            --build-name="$EFIR_VERSION" --build-number="$EFIR_BUILD" \
             --dart-define=EFIR_UPDATE_PUBLIC_KEY=${{ vars.EFIR_UPDATE_PUBLIC_KEY }} \
             --target-platform android-arm,android-arm64 \
             --split-per-abi
