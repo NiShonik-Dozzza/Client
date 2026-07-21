@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Политики администратора устройства. Пустой набор — намеренно: Device Owner
+    нужен нам единственно ради тихой установки обновлений (PackageInstaller),
+    а не чтобы управлять паролями или шифрованием на устройстве.
+-->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies />
+</device-admin>
