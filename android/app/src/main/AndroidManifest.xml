@@ -5,6 +5,12 @@
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <!--
+        Установка обновления, полученного из панели. Device Owner ставит молча;
+        без него система покажет диалог подтверждения — тогда клиент вернёт
+        в панель статус needs_confirmation, а не соврёт про успех.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
 
     <!--
         Android TV: required="false" означает что приложение работает и на телефоне, и на TV.
