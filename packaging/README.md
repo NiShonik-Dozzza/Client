@@ -74,6 +74,6 @@ flutter build apk --release --target-platform android-arm64 --split-per-abi
 
 | Платформа | Файл | Установка |
 |---|---|---|
-| Windows 10/11 | `efir-setup-X.Y.Z-windows-x64.exe` | Запустить от администратора, watchdog регистрируется автоматически |
+| Windows 10/11 | `efir-setup-X.Y.Z-windows-x64.exe` | Запустить обычным пользователем — ставится в его профиль, watchdog регистрируется автоматически. Права администратора нужны один раз и только если в системе нет Visual C++ Runtime |
 | Linux (любой дистрибутив) | `efir-client_X.Y.Z_linux_amd64.tar.gz` | `tar xzf *.tar.gz && sudo ./*linux*/install.sh kiosk` |
 | Android / Android TV | `efir-X.Y.Z-android-arm64.apk` | `adb install -r *.apk` или через MDM |

@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Устанавливает EFIR watchdog как задачу Windows Task Scheduler.
@@ -21,7 +21,9 @@
 param(
     [string]$AppPath           = "C:\Program Files\EFIR\efir.exe",
     [string]$WatchdogScriptPath = "",
-    [string]$TaskUser          = $env:USERNAME
+    [string]$TaskUser          = $env:USERNAME,
+    # Тихий режим для установщика (в т.ч. при автообновлении): без вопросов.
+    [switch]$Silent
 )
 
 Set-StrictMode -Version Latest
@@ -40,13 +42,8 @@ if (-not (Test-Path $WatchdogScriptPath)) {
     Write-Error "watchdog.ps1 не найден: $WatchdogScriptPath"
 }
 
-# Нужны права администратора для Task Scheduler
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator
-)
-if (-not $isAdmin) {
-    Write-Error "Запустите скрипт с правами администратора (Run as Administrator)"
-}
+# Права администратора НЕ нужны: задача регистрируется на текущего пользователя
+# и запускается от него же. Это и позволяет обновлять клиента без UAC.
 
 # --- Регистрация задачи watchdog ---
 $watchdogTaskName = "EFIR-Watchdog"
@@ -93,9 +90,15 @@ Write-Host "  Удалить:           Unregister-ScheduledTask -TaskName '$wat
 Write-Host "  Логи watchdog:     `$env:APPDATA\efir\watchdog.log"
 Write-Host ""
 
-# Стартовать задачу немедленно
-$start = Read-Host "Запустить watchdog прямо сейчас? (y/n)"
-if ($start -eq 'y') {
+# Стартовать задачу немедленно. В тихом режиме — без вопросов: этот скрипт
+# вызывается установщиком, в том числе при автообновлении, где спросить некого.
+if ($Silent) {
     Start-ScheduledTask -TaskName $watchdogTaskName
     Write-Host "Watchdog запущен."
+} else {
+    $start = Read-Host "Запустить watchdog прямо сейчас? (y/n)"
+    if ($start -eq 'y') {
+        Start-ScheduledTask -TaskName $watchdogTaskName
+        Write-Host "Watchdog запущен."
+    }
 }

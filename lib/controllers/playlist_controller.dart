@@ -314,6 +314,9 @@ class PlaylistController extends GetxController {
       // Пины сертификатов должны быть в памяти до создания HTTP-клиентов:
       // badCertificateCallback синхронный.
       await TrustStore.instance.load();
+      // Мы поднялись — значит обновление либо встало, либо провалилось.
+      // В обоих случаях watchdog снова должен сторожить процесс.
+      await UpdateInstaller.clearUpdateLock();
       await _loadClientVersion();
       final cfg = await _config.load();
       await _applyMediaRoot(cfg.mediaRoot);

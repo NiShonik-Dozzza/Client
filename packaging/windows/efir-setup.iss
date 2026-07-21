@@ -38,19 +38,34 @@ SolidCompression=yes
 ; Минимальная версия Windows: 10 (требование Flutter + media_kit)
 MinVersion=10.0.19041
 
-; Требуем права администратора для установки watchdog в Task Scheduler
-PrivilegesRequired=admin
+; Установка НЕ требует администратора — и это принципиально: обновление из
+; панели запускает установщик от того же пользователя, что и приложение.
+; Машинная установка в Program Files потребовала бы UAC при каждом обновлении,
+; а на экране, к которому никто не подходит, диалог UAC = обновления нет.
+; {auto*}-константы сами разворачиваются в пользовательские пути.
+; Админ всё ещё может поставить на всю машину: кнопка выбора в мастере.
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+
+; Обновление поверх работающего клиента: закрыть приложение перед заменой файлов.
+CloseApplications=yes
+RestartApplications=no
 
 ; Запустить приложение после установки
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Запустить {#AppName}"; \
     Flags: nowait postinstall skipifsilent
 
+; То же, но для тихого обновления: там страницы «Готово» нет, а клиент
+; обязан подняться сам — иначе экран останется чёрным до перезагрузки.
+Filename: "{app}\{#AppExeName}"; \
+    Flags: nowait runasoriginaluser; Check: IsSilentInstall
+
 ; Зарегистрировать watchdog в Task Scheduler после установки
 Filename: "powershell.exe"; \
-    Parameters: "-NonInteractive -ExecutionPolicy Bypass -File ""{app}\install-watchdog.ps1"" -AppPath ""{app}\{#AppExeName}"""; \
+    Parameters: "-NonInteractive -ExecutionPolicy Bypass -File ""{app}\install-watchdog.ps1"" -AppPath ""{app}\{#AppExeName}"" -Silent"; \
     Description: "Установить автозапуск (watchdog)"; \
-    Flags: runhidden postinstall; \
+    Flags: runhidden runasoriginaluser; \
     StatusMsg: "Настройка автозапуска..."
 
 [UninstallRun]
@@ -73,7 +88,7 @@ Name: "{group}\{#AppName}";          Filename: "{app}\{#AppExeName}"
 Name: "{group}\Удалить {#AppName}";  Filename: "{uninstallexe}"
 
 ; Ярлык на рабочем столе (опционально — можно убрать)
-Name: "{commondesktop}\{#AppName}";  Filename: "{app}\{#AppExeName}"; \
+Name: "{autodesktop}\{#AppName}";  Filename: "{app}\{#AppExeName}"; \
     Tasks: desktopicon
 
 [Tasks]
@@ -90,6 +105,13 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 [Code]
 var
   VCRedistPage: TDownloadWizardPage;
+
+// Обёртка для Check: тихая установка — это автообновление из панели,
+// там некому нажать «Запустить» на финальной странице.
+function IsSilentInstall: Boolean;
+begin
+  Result := WizardSilent;
+end;
 
 // Проверяем наличие VC++ 2015-2022 Redistributable x64 через реестр
 function VCRedistNeedsInstall: Boolean;
@@ -122,6 +144,16 @@ begin
   Result := '';
   if not VCRedistNeedsInstall then
     Exit;
+
+  // Runtime ставится только на всю машину — это единственное место, где нужен
+  // администратор. При обычной пользовательской установке честно говорим, что
+  // делать, вместо падения с невнятным кодом.
+  if not IsAdminInstallMode then begin
+    Result := 'Не установлен Visual C++ Runtime, а он ставится только с правами администратора.' + #13#10 +
+              'Установите его один раз: https://aka.ms/vs/17/release/vc_redist.x64.exe' + #13#10 +
+              'либо запустите этот установщик от имени администратора.';
+    Exit;
+  end;
 
   VCRedistPage.Clear;
   VCRedistPage.Add(
