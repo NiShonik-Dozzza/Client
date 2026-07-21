@@ -20,6 +20,8 @@ import '../services/manifest_store.dart';
 import '../services/media_cache_service.dart';
 import '../services/storage_service.dart';
 import '../services/trust_store.dart';
+import '../services/update_installer.dart';
+import '../services/update_service.dart';
 
 enum DeviceSetupStage { booting, setupRequired, pendingApproval, ready }
 
@@ -59,6 +61,10 @@ class CleartextHttpPendingError implements Exception {
 
 class PlaylistController extends GetxController {
   String _clientVersion = 'efir-client';
+  // Чистые version/build отдельно от витринной строки: панель сравнивает их
+  // с релизом, и "efir-client 1.0.0+1" туда отправлять нельзя.
+  String _appVersion = '';
+  int _appBuild = 0;
 
   // Диагностика устройства для status screen.
   final Rxn<DateTime> lastHeartbeatAt = Rxn<DateTime>();
@@ -121,6 +127,10 @@ class PlaylistController extends GetxController {
   Timer? _heartbeatTimer;
   Timer? _registrationPollTimer;
   Timer? _storageTimer;
+  Timer? _updateTimer;
+  final _updateService = UpdateService();
+  bool _updateCycleInFlight = false;
+  PreparedUpdate? _preparedUpdate;
   int _manifestFailures = 0;
   bool _manifestInFlight = false;
   Future<void> _prefetchChain = Future.value();
@@ -128,6 +138,9 @@ class PlaylistController extends GetxController {
 
   static const Duration _manifestBaseInterval = Duration(seconds: 5);
   static const Duration _heartbeatInterval = Duration(seconds: 25);
+  // Обновления — редкое событие; чаще опрашивать незачем, а лишний трафик на
+  // сети из десятков экранов заметен.
+  static const Duration _updateCheckInterval = Duration(minutes: 30);
   static const List<int> _manifestBackoffSeconds = [2, 5, 10, 20, 30];
   static const Duration _storageCheckInterval = Duration(seconds: 15);
   static const Duration _storageSlowThreshold = Duration(milliseconds: 1500);
@@ -291,6 +304,7 @@ class PlaylistController extends GetxController {
     _heartbeatTimer?.cancel();
     _registrationPollTimer?.cancel();
     _storageTimer?.cancel();
+    _updateTimer?.cancel();
     super.onClose();
   }
 
@@ -300,6 +314,9 @@ class PlaylistController extends GetxController {
       // Пины сертификатов должны быть в памяти до создания HTTP-клиентов:
       // badCertificateCallback синхронный.
       await TrustStore.instance.load();
+      // Мы поднялись — значит обновление либо встало, либо провалилось.
+      // В обоих случаях watchdog снова должен сторожить процесс.
+      await UpdateInstaller.clearUpdateLock();
       await _loadClientVersion();
       final cfg = await _config.load();
       await _applyMediaRoot(cfg.mediaRoot);
@@ -585,6 +602,7 @@ class PlaylistController extends GetxController {
     _registrationPollTimer?.cancel();
     _manifestTimer?.cancel();
     _heartbeatTimer?.cancel();
+    _updateTimer?.cancel();
     final auth = _auth;
     if (auth != null) {
       _auth = auth.copyWith(
@@ -619,6 +637,124 @@ class PlaylistController extends GetxController {
       _heartbeatInterval,
       (_) => _sendHeartbeat(),
     );
+    _startUpdateChecks();
+  }
+
+  void _startUpdateChecks() {
+    _updateTimer?.cancel();
+    if (!UpdateService.isEnabled) return;
+    _updateTimer = Timer.periodic(
+      _updateCheckInterval,
+      (_) => _runUpdateCycle(),
+    );
+    // Первая проверка сразу после старта: экран мог простоять выключенным,
+    // пока раскатывали обновление.
+    unawaited(_runUpdateCycle());
+  }
+
+  /// Проверить → скачать (с проверкой подписи) → поставить, если можно сейчас.
+  ///
+  /// Любая ошибка здесь не должна мешать показу контента: обновление —
+  /// сервисная задача, а экран в первую очередь должен показывать.
+  Future<void> _runUpdateCycle() async {
+    if (_updateCycleInFlight) return;
+    final auth = _auth;
+    final server = _serverAddress.value;
+    if (auth == null || !auth.hasToken || server.isEmpty) return;
+
+    _updateCycleInFlight = true;
+    try {
+      final info = await _updateService.check(
+        serverBase: server,
+        deviceId: auth.deviceId,
+        token: auth.token,
+      );
+      if (info == null) {
+        _preparedUpdate = null;
+        return;
+      }
+
+      var prepared = _preparedUpdate;
+      if (prepared == null || prepared.info.sha256 != info.sha256) {
+        await _updateService.reportStatus(
+          serverBase: server,
+          deviceId: auth.deviceId,
+          token: auth.token,
+          state: 'downloading',
+          version: info.version,
+        );
+        prepared = await _updateService.download(info, token: auth.token);
+        await _updateService.cleanup(keep: prepared.file);
+        _preparedUpdate = prepared;
+        await _updateService.reportStatus(
+          serverBase: server,
+          deviceId: auth.deviceId,
+          token: auth.token,
+          state: 'ready',
+          version: info.version,
+        );
+      }
+
+      // Скачивать можно всегда, ставить — только в окне: установка рвёт показ.
+      if (!info.installAllowedNow) {
+        await AppLogger.log(
+          'update ${info.version} ready, waiting for window ${info.updateWindow}',
+        );
+        return;
+      }
+
+      await _updateService.reportStatus(
+        serverBase: server,
+        deviceId: auth.deviceId,
+        token: auth.token,
+        state: 'installing',
+        version: info.version,
+      );
+      final result = await UpdateInstaller.install(prepared.file);
+      switch (result.outcome) {
+        case InstallOutcome.started:
+          // Дальше нас заменят/перезапустят; статус подтвердит новая версия
+          // своим heartbeat с новым client_build.
+          break;
+        case InstallOutcome.needsConfirmation:
+        case InstallOutcome.unsupported:
+          // Файл проверен и лежит на устройстве — в панели это `ready`,
+          // чтобы оператор видел: доехало, но само не встанет.
+          await _updateService.reportStatus(
+            serverBase: server,
+            deviceId: auth.deviceId,
+            token: auth.token,
+            state: 'ready',
+            version: info.version,
+          );
+          break;
+        case InstallOutcome.failed:
+          await _updateService.reportStatus(
+            serverBase: server,
+            deviceId: auth.deviceId,
+            token: auth.token,
+            state: 'failed',
+            version: info.version,
+            error: result.message,
+          );
+          break;
+      }
+    } on UpdateRejected catch (e) {
+      // Подпись/хеш не сошлись — это не сетевая неурядица, а сигнал.
+      await AppLogger.log('update rejected: ${e.reason}');
+      _preparedUpdate = null;
+      await _updateService.reportStatus(
+        serverBase: server,
+        deviceId: auth.deviceId,
+        token: auth.token,
+        state: 'failed',
+        error: e.reason,
+      );
+    } catch (e) {
+      await AppLogger.log('update cycle failed: $e');
+    } finally {
+      _updateCycleInFlight = false;
+    }
   }
 
   void _scheduleRegistrationPoll(Duration delay) {
@@ -927,6 +1063,8 @@ class PlaylistController extends GetxController {
     try {
       final info = await PackageInfo.fromPlatform();
       _clientVersion = 'efir-client ${info.version}+${info.buildNumber}';
+      _appVersion = info.version;
+      _appBuild = int.tryParse(info.buildNumber) ?? 0;
     } catch (e) {
       await AppLogger.log('client version load failed: $e');
     }
@@ -956,7 +1094,10 @@ class PlaylistController extends GetxController {
         deviceId: auth.deviceId,
         currentRevision: currentRevision,
         nowPlaying: _nowPlaying,
-        clientVersion: _clientVersion,
+        clientVersion: _appVersion.isNotEmpty ? _appVersion : _clientVersion,
+        clientBuild: _appBuild,
+        platform: UpdateService.platform,
+        arch: UpdateService.arch,
         networkState: _manifestFailures == 0 ? 'online' : 'degraded',
         cachedMediaCount: cacheDiagnostics.cachedMediaCount,
         cacheSizeBytes: cacheDiagnostics.cacheSizeBytes,

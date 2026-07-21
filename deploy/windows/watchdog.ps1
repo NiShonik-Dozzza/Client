@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     EFIR Digital Signage - Watchdog процесс.
@@ -23,6 +23,11 @@ $LogDir  = "$env:APPDATA\efir"
 $LogPath = "$LogDir\watchdog.log"
 $MaxLogBytes = 2MB
 
+# Пока идёт обновление, приложение закрыто намеренно — перезапускать его нельзя:
+# watchdog поднимет старую копию и заблокирует файлы, которые заменяет установщик.
+$UpdateLockPath = "$LogDir\update-in-progress"
+$UpdateLockMaxMinutes = 15
+
 # --- Логирование ---
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -36,6 +41,24 @@ function Write-Log {
         Add-Content -Path $LogPath -Value $line -Encoding UTF8
     } catch { <# Не падаем если лог недоступен #> }
     Write-Host $line
+}
+
+# --- Идёт ли установка обновления ---
+# Замок с истечением по времени: если установщик умер, не оставив следов,
+# watchdog всё равно вернётся к работе, а не оставит экран чёрным навсегда.
+function Test-UpdateInProgress {
+    try {
+        if (-not (Test-Path $UpdateLockPath)) { return $false }
+        $age = (Get-Date) - (Get-Item $UpdateLockPath).LastWriteTime
+        if ($age.TotalMinutes -gt $UpdateLockMaxMinutes) {
+            Write-Log "Замок обновления протух ($([int]$age.TotalMinutes) мин) — снимаем" "WARN"
+            Remove-Item $UpdateLockPath -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 # --- Запуск приложения ---
@@ -71,6 +94,11 @@ $maxConsecutiveFailures = 10  # После 10 неудач подряд — жд
 
 while ($true) {
     Start-Sleep -Seconds $CheckIntervalSeconds
+
+    if (Test-UpdateInProgress) {
+        Write-Log "Идёт установка обновления — перезапуск отложен"
+        continue
+    }
 
     $procs = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
     if (-not $procs) {

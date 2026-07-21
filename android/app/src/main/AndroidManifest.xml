@@ -5,6 +5,12 @@
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <!--
+        Установка обновления, полученного из панели. Device Owner ставит молча;
+        без него система покажет диалог подтверждения — тогда клиент вернёт
+        в панель статус needs_confirmation, а не соврёт про успех.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
 
     <!--
         Android TV: required="false" означает что приложение работает и на телефоне, и на TV.
@@ -48,6 +54,23 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
             </intent-filter>
         </activity>
+
+        <!--
+            Компонент для назначения приложения Device Owner:
+              adb shell dpm set-device-owner com.efir.client/.EfirDeviceAdminReceiver
+            Без него тихая установка обновлений на Android невозможна.
+        -->
+        <receiver
+            android:name=".EfirDeviceAdminReceiver"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin_policies"/>
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED"/>
+            </intent-filter>
+        </receiver>
 
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
