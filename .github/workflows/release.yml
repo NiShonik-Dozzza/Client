@@ -55,11 +55,17 @@ jobs:
             --build-name="$EFIR_VERSION" --build-number="$EFIR_BUILD" \
             --dart-define=EFIR_UPDATE_PUBLIC_KEY=${{ vars.EFIR_UPDATE_PUBLIC_KEY }}
 
-      - name: Download Inno Setup
+      # Через Chocolatey, а не прямой ссылкой: jrsoftware.org/download.php —
+      # редирект на зеркало, и он уже отдавал не исполняемый файл, из-за чего
+      # сборка падала на «file is corrupted and unreadable».
+      - name: Install Inno Setup
         run: |
-          $url = "https://jrsoftware.org/download.php/is.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\innosetup.exe"
-          Start-Process "$env:TEMP\innosetup.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
+          choco install innosetup --no-progress -y
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe не найден после установки Inno Setup: $iscc"
+          }
+          & $iscc /? | Select-Object -First 1
 
       - name: Set version in Inno Setup script
         shell: powershell
