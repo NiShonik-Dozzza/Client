@@ -52,6 +52,8 @@ dependencies:
   screen_retriever: ^0.2.0
   package_info_plus: ^10.1.0 # фактическая версия задаётся dependency_overrides (локальный путь)
   cryptography: ^2.9.0
+  archive: ^4.0.9
+  webview_flutter: ^4.14.1
 
 dev_dependencies:
   flutter_test:

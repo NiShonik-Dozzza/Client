@@ -1,6 +1,6 @@
 import 'package:path/path.dart' as p;
 
-enum ManifestContentType { media, playlist }
+enum ManifestContentType { media, playlist, html }
 
 enum ManifestLoopMode { none, fill }
 
@@ -16,6 +16,7 @@ class Manifest {
   final List<ManifestItem> items;
   final List<ManifestMedia> media;
   final List<ManifestPlaylist> playlists;
+  final List<ManifestHtmlPage> htmlPages;
 
   Manifest({
     required this.deviceId,
@@ -29,12 +30,14 @@ class Manifest {
     required this.items,
     required this.media,
     required this.playlists,
+    this.htmlPages = const [],
   });
 
   factory Manifest.fromJson(Map<String, dynamic> json) {
     final itemsRaw = (json['items'] as List? ?? []).cast<dynamic>();
     final mediaRaw = (json['media'] as List? ?? []).cast<dynamic>();
     final playlistsRaw = (json['playlists'] as List? ?? []).cast<dynamic>();
+    final htmlRaw = (json['html_pages'] as List? ?? []).cast<dynamic>();
 
     final items =
         itemsRaw
@@ -72,6 +75,9 @@ class Manifest {
       items: items,
       media: media,
       playlists: playlists,
+      htmlPages: htmlRaw
+          .map((e) => ManifestHtmlPage.fromJson((e as Map).cast<String, dynamic>()))
+          .toList(),
     );
   }
 
@@ -87,11 +93,19 @@ class Manifest {
     'items': items.map((e) => e.toJson()).toList(),
     'media': media.map((e) => e.toJson()).toList(),
     'playlists': playlists.map((e) => e.toJson()).toList(),
+    'html_pages': htmlPages.map((e) => e.toJson()).toList(),
   };
 
   ManifestMedia? mediaById(int id) {
     for (final m in media) {
       if (m.id == id) return m;
+    }
+    return null;
+  }
+
+  ManifestHtmlPage? htmlPageById(int id) {
+    for (final page in htmlPages) {
+      if (page.id == id) return page;
     }
     return null;
   }
@@ -180,7 +194,9 @@ class ManifestItem {
       endTime: _parseTime(json['end_time'] as String?),
       contentType: contentTypeRaw == 'playlist'
           ? ManifestContentType.playlist
-          : ManifestContentType.media,
+          : contentTypeRaw == 'html'
+              ? ManifestContentType.html
+              : ManifestContentType.media,
       contentId: _asInt(json['content_id']),
       loopMode: loopModeRaw == 'fill'
           ? ManifestLoopMode.fill
@@ -195,7 +211,9 @@ class ManifestItem {
     'end_time': endTime.toIso8601String(),
     'content_type': contentType == ManifestContentType.playlist
         ? 'playlist'
-        : 'media',
+        : contentType == ManifestContentType.html
+            ? 'html'
+            : 'media',
     'content_id': contentId,
     'loop_mode': loopMode == ManifestLoopMode.fill ? 'fill' : 'none',
     'priority': priority,
@@ -333,6 +351,86 @@ class ManifestPlaylistItem {
     'media_id': mediaId,
     'duration_sec': durationSec,
     'position': position,
+  };
+}
+
+
+/// Опубликованная HTML-страница в манифесте.
+///
+/// Адресов источников данных здесь нет — только их ключи: адреса знает панель,
+/// и разъезжаться по экранам вместе с бандлом они не должны.
+class ManifestHtmlPage {
+  const ManifestHtmlPage({
+    required this.id,
+    required this.name,
+    required this.versionNo,
+    required this.bundleMediaId,
+    required this.entryPath,
+    required this.allowNetwork,
+    required this.sourceKeys,
+    required this.minDurationSec,
+    required this.maxDurationSec,
+    required this.readyTimeoutSec,
+    required this.onDone,
+    required this.syncPagination,
+    required this.refreshSec,
+  });
+
+  final int id;
+  final String name;
+  final int versionNo;
+  final int bundleMediaId;
+  final String entryPath;
+  final bool allowNetwork;
+  final List<String> sourceKeys;
+  final int minDurationSec;
+
+  /// Потолок показа. Страница сама сообщает о завершении через `efir.done()`,
+  /// и без потолка одна сломанная строчка JS держала бы экран навсегда.
+  final int maxDurationSec;
+  final int readyTimeoutSec;
+
+  /// next | restart | hold — что делать, если страница закончила раньше слота.
+  final String onDone;
+  final bool syncPagination;
+  final int? refreshSec;
+
+  factory ManifestHtmlPage.fromJson(Map<String, dynamic> json) {
+    return ManifestHtmlPage(
+      id: _asInt(json['id']),
+      name: (json['name'] as String?)?.trim() ?? '',
+      versionNo: _asInt(json['version_no']),
+      bundleMediaId: _asInt(json['bundle_media_id']),
+      entryPath: (json['entry_path'] as String?)?.trim().isNotEmpty == true
+          ? (json['entry_path'] as String).trim()
+          : 'index.html',
+      allowNetwork: json['allow_network'] == true,
+      sourceKeys: ((json['source_keys'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .toList(),
+      minDurationSec: _asInt(json['min_duration_sec']),
+      maxDurationSec: _asInt(json['max_duration_sec'], 300),
+      readyTimeoutSec: _asInt(json['ready_timeout_sec'], 15),
+      onDone: (json['on_done'] as String?)?.trim() ?? 'next',
+      syncPagination: json['sync_pagination'] == true,
+      refreshSec: _asNullableInt(json['refresh_sec']),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'version_no': versionNo,
+    'bundle_media_id': bundleMediaId,
+    'entry_path': entryPath,
+    'allow_network': allowNetwork,
+    'source_keys': sourceKeys,
+    'min_duration_sec': minDurationSec,
+    'max_duration_sec': maxDurationSec,
+    'ready_timeout_sec': readyTimeoutSec,
+    'on_done': onDone,
+    'sync_pagination': syncPagination,
+    'refresh_sec': refreshSec,
   };
 }
 
