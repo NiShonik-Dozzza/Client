@@ -134,15 +134,47 @@ class LocalWebServer {
       return;
     }
 
+    final contentType = _contentTypeFor(relative);
     _applySecurityHeaders(request.response);
-    request.response.headers.contentType = _contentTypeFor(relative);
+    request.response.headers.contentType = contentType;
     request.response.headers.set('Cache-Control', 'no-store');
     if (request.method == 'HEAD') {
       await request.response.close();
       return;
     }
+
+    if (contentType.mimeType == ContentType.html.mimeType) {
+      // Мост подключаем сами. Автор страницы не знает и не должен знать про
+      // случайный токен в пути, а абсолютная ссылка вида /__efir/efir.js в его
+      // разметке ушла бы мимо и молча оставила страницу без efir.
+      final document = await file.readAsString();
+      request.response.write(_withBridge(document));
+      await request.response.close();
+      return;
+    }
+
     await request.response.addStream(file.openRead());
     await request.response.close();
+  }
+
+  /// Вставляет подключение моста в разметку страницы.
+  String _withBridge(String document) {
+    final tag = '<script src="/$_token/__efir/efir.js"></script>';
+    final lower = document.toLowerCase();
+
+    // До остальных скриптов: страница вправе звать efir.* сразу.
+    final headEnd = lower.indexOf('</head>');
+    if (headEnd != -1) {
+      return document.substring(0, headEnd) + tag + document.substring(headEnd);
+    }
+    final bodyStart = lower.indexOf('<body');
+    if (bodyStart != -1) {
+      final close = document.indexOf('>', bodyStart);
+      if (close != -1) {
+        return document.substring(0, close + 1) + tag + document.substring(close + 1);
+      }
+    }
+    return tag + document;
   }
 
   /// CSP запрещает странице ходить куда-либо, кроме собственного origin.

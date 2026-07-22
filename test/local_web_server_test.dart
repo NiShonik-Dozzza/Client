@@ -83,6 +83,15 @@ void main() {
     expect(response.headers['x-content-type-options'], 'nosniff');
   });
 
+  test('мост подключается к странице автоматически', () async {
+    // Автор страницы не знает про случайный токен в пути, поэтому вписать
+    // рабочую ссылку на мост он не может. Сервер делает это сам.
+    final response = await http.get(server.entryUrl('index.html'));
+    expect(response.statusCode, 200);
+    expect(response.body, contains('/${token()}/__efir/efir.js'));
+    expect(response.body, contains('Страница'), reason: 'разметка не должна теряться');
+  });
+
   test('мост efir.js отдаётся и содержит контракт завершения', () async {
     final response = await http.get(base().replace(path: '/${token()}/__efir/efir.js'));
     expect(response.statusCode, 200);
