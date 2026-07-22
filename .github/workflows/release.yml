@@ -303,7 +303,14 @@ jobs:
 
             | Платформа | Файл | Инструкция |
             |---|---|---|
-            | Windows 10/11 | `efir-setup-*-windows-x64.exe` | Запустить от администратора |
+            | Windows 10/11 | `efir-setup-*-windows-x64.exe` | Запустить. Права администратора нужны только при первой установке на машину — для Visual C++ Runtime |
             | Linux (любой дистрибутив) | `efir-client_*_linux_amd64.tar.gz` | `tar xzf *.tar.gz && sudo ./*linux*/install.sh kiosk` |
             | Android / Android TV (64-бит) | `efir-*-android-arm64.apk` | `adb install -r *.apk` |
             | Android TV (32-бит, старые/дешёвые SmartTV) | `efir-*-android-armv7.apk` | `adb install -r *.apk` |
+
+            ## HTML-страницы
+
+            Показ HTML требует WebView. На Windows это WebView2 — установщик
+            доставит его сам, если в системе нет. На Linux нужен пакет
+            `libwebkit2gtk-4.1-0`. Без них клиент работает как раньше:
+            пропускаются только HTML-слоты, видео и картинки не затрагиваются.

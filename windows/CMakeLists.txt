@@ -32,6 +32,20 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
 
+# Плагин webview_all_windows подключает <experimental/coroutine>. Начиная с
+# MSVC 14.51 (Visual Studio 18) один только этот include — жёсткая ошибка
+# компиляции STL1011, а не предупреждение: заголовок объявлен устаревшим в
+# пользу C++20 <coroutine>. Макрос — то, что предлагает сам компилятор в тексте
+# ошибки.
+#
+# Это заплатка на чужой код, а не наше решение: заголовок обещают убрать
+# совсем, и тогда макрос не спасёт. Снять, когда webview_all_windows перейдёт
+# на C++20 <coroutine>.
+#
+# Директивное свойство наследуется подкаталогами, добавленными ниже, — то есть
+# и плагинами из generated_plugins.cmake.
+add_definitions(-D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+
 # Compilation settings that should be applied to most targets.
 #
 # Be cautious about adding new options here, as plugins use this function by
