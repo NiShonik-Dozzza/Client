@@ -9,4 +9,21 @@
             <certificates src="system"/>
         </trust-anchors>
     </base-config>
+
+    <!--
+        Исключение для петли. HTML-страница отдаётся собственным сервером
+        приложения на 127.0.0.1 по http: TLS для самого себя лишён смысла —
+        трафик не покидает устройство, а самоподписанный сертификат пришлось
+        бы ещё и объяснять WebView.
+
+        Без этого исключения release-сборка блокирует загрузку страницы, и
+        экран показывает пустоту — именно так HTML и «не работал».
+
+        Наружу это ничего не открывает: правило действует только на loopback,
+        любые внешние адреса по-прежнему обязаны быть HTTPS.
+    -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
 </network-security-config>
