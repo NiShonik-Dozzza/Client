@@ -53,7 +53,16 @@ dependencies:
   package_info_plus: ^10.1.0 # фактическая версия задаётся dependency_overrides (локальный путь)
   cryptography: ^2.9.0
   archive: ^4.0.9
-  webview_flutter: ^4.14.1
+  # WebView — федеративная реализация того же platform interface, что и
+  # webview_flutter, но со всеми нашими платформами сразу: Android, Windows
+  # (WebView2), Linux (WebKitGTK). На Android/iOS внутри те же официальные
+  # webview_flutter_android / webview_flutter_wkwebview, так что поведение
+  # там не меняется.
+  #
+  # Версия точная, без `^`: под капотом четыре разных браузерных движка, и
+  # единым здесь стал API, а не поведение. Расхождение вылезет на экране, а не
+  # при сборке, поэтому обновляем осознанно и с проверкой на всех платформах.
+  webview_all: 1.2.1
 
 dev_dependencies:
   flutter_test:

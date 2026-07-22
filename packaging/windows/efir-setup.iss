@@ -103,8 +103,15 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     Flags: uninsdeletevalue; Tasks: not desktopicon
 
 [Code]
+const
+  VCRedistUrl  = 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
+  { Evergreen Bootstrapper: ~2 МБ, сам скачивает и ставит актуальный рантайм. }
+  WebView2Url  = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703';
+  { Идентификатор WebView2 Runtime в EdgeUpdate — по нему и определяем наличие. }
+  WebView2Guid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+
 var
-  VCRedistPage: TDownloadWizardPage;
+  PrereqPage: TDownloadWizardPage;
 
 // Обёртка для Check: тихая установка — это автообновление из панели,
 // там некому нажать «Запустить» на финальной странице.
@@ -126,65 +133,139 @@ begin
   );
 end;
 
+// Установлен ли WebView2 Runtime.
+//
+// Рантайм регистрируется в EdgeUpdate и бывает трёх видов размещения: на 64-бит
+// системе — в WOW6432Node, на 32-бит — в обычной ветке, и отдельно
+// пользовательская установка в HKCU. Проверяем все три: пропустить одну значит
+// поставить рантайм второй раз поверх имеющегося.
+//
+// `pv` = '0.0.0.0' означает «запись есть, рантайма нет» — так EdgeUpdate
+// помечает удалённый компонент.
+function WebView2Installed: Boolean;
+var
+  Ver: String;
+begin
+  Result := False;
+
+  if RegQueryStringValue(HKLM32, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\' + WebView2Guid, 'pv', Ver) then
+    if (Ver <> '') and (Ver <> '0.0.0.0') then begin Result := True; Exit; end;
+
+  if IsWin64 then
+    if RegQueryStringValue(HKLM64, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\' + WebView2Guid, 'pv', Ver) then
+      if (Ver <> '') and (Ver <> '0.0.0.0') then begin Result := True; Exit; end;
+
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\EdgeUpdate\Clients\' + WebView2Guid, 'pv', Ver) then
+    if (Ver <> '') and (Ver <> '0.0.0.0') then begin Result := True; Exit; end;
+end;
+
 // Создаём страницу загрузки при запуске мастера установки
 procedure InitializeWizard;
 begin
-  VCRedistPage := CreateDownloadPage(
+  PrereqPage := CreateDownloadPage(
     'Подготовка к установке',
-    'Загрузка Visual C++ Runtime с серверов Microsoft...',
+    'Загрузка компонентов с серверов Microsoft...',
     nil
   );
 end;
 
-// Перед установкой: скачиваем и устанавливаем VC++ если его нет
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+// Ставит WebView2 Runtime, если его нет.
+//
+// Ошибка здесь НЕ прерывает установку — и это осознанно. Без WebView2 клиент
+// прекрасно играет видео, картинки и плейлисты; не открываются только
+// HTML-страницы, и плеер честно пропускает такой слот с записью в лог.
+// Ронять из-за этого установку нельзя тем более, что тот же установщик
+// запускается тихо при автообновлении из панели: отказ означал бы экран,
+// оставшийся на старой версии без единого признака почему.
+procedure InstallWebView2;
 var
   ResultCode: Integer;
 begin
-  Result := '';
-  if not VCRedistNeedsInstall then
+  if WebView2Installed then
     Exit;
 
-  // Runtime ставится только на всю машину — это единственное место, где нужен
-  // администратор. При обычной пользовательской установке честно говорим, что
-  // делать, вместо падения с невнятным кодом.
-  if not IsAdminInstallMode then begin
-    Result := 'Не установлен Visual C++ Runtime, а он ставится только с правами администратора.' + #13#10 +
-              'Установите его один раз: https://aka.ms/vs/17/release/vc_redist.x64.exe' + #13#10 +
-              'либо запустите этот установщик от имени администратора.';
-    Exit;
-  end;
-
-  VCRedistPage.Clear;
-  VCRedistPage.Add(
-    'https://aka.ms/vs/17/release/vc_redist.x64.exe',
-    'vc_redist.x64.exe',
-    ''
-  );
-  VCRedistPage.Show;
+  PrereqPage.Clear;
+  PrereqPage.Add(WebView2Url, 'MicrosoftEdgeWebview2Setup.exe', '');
+  PrereqPage.Show;
   try
     try
-      VCRedistPage.Download;
+      PrereqPage.Download;
+      // Без прав администратора bootstrapper ставит рантайм в профиль
+      // пользователя — то есть UAC не появится и на автообновлении.
       Exec(
-        ExpandConstant('{tmp}\vc_redist.x64.exe'),
-        '/install /quiet /norestart',
+        ExpandConstant('{tmp}\MicrosoftEdgeWebview2Setup.exe'),
+        '/silent /install',
         '',
         SW_HIDE,
         ewWaitUntilTerminated,
         ResultCode
       );
       if ResultCode <> 0 then
-        { строка-продолжение не должна начинаться с # — ISPP примет её за директиву }
-        Result := 'Не удалось установить Visual C++ Runtime (код: ' + IntToStr(ResultCode) + ').' + #13#10 +
-                  'Установите вручную: https://aka.ms/vs/17/release/vc_redist.x64.exe';
+        Log('WebView2 runtime install failed with code ' + IntToStr(ResultCode) +
+            '; HTML pages will not be available');
     except
-      Result := 'Ошибка загрузки Visual C++ Runtime.' + #13#10 +
-                'Проверьте интернет-соединение или установите вручную:' + #13#10 +
-                'https://aka.ms/vs/17/release/vc_redist.x64.exe';
+      Log('WebView2 runtime download failed: ' + GetExceptionMessage +
+          '; HTML pages will not be available');
     end;
   finally
-    VCRedistPage.Hide;
+    PrereqPage.Hide;
   end;
+end;
+
+// Перед установкой: доставляем недостающие компоненты.
+//
+// Разница между ними принципиальная: без VC++ Runtime приложение не стартует
+// вообще, поэтому его отсутствие — повод прервать установку. WebView2 нужен
+// одному виду контента, поэтому он ставится «по возможности».
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Result := '';
+
+  if VCRedistNeedsInstall then begin
+    // Runtime ставится только на всю машину — это единственное место, где нужен
+    // администратор. При обычной пользовательской установке честно говорим, что
+    // делать, вместо падения с невнятным кодом.
+    if not IsAdminInstallMode then begin
+      Result := 'Не установлен Visual C++ Runtime, а он ставится только с правами администратора.' + #13#10 +
+                'Установите его один раз: ' + VCRedistUrl + #13#10 +
+                'либо запустите этот установщик от имени администратора.';
+      Exit;
+    end;
+
+    PrereqPage.Clear;
+    PrereqPage.Add(VCRedistUrl, 'vc_redist.x64.exe', '');
+    PrereqPage.Show;
+    try
+      try
+        PrereqPage.Download;
+        Exec(
+          ExpandConstant('{tmp}\vc_redist.x64.exe'),
+          '/install /quiet /norestart',
+          '',
+          SW_HIDE,
+          ewWaitUntilTerminated,
+          ResultCode
+        );
+        if ResultCode <> 0 then
+          { строка-продолжение не должна начинаться с # — ISPP примет её за директиву }
+          Result := 'Не удалось установить Visual C++ Runtime (код: ' + IntToStr(ResultCode) + ').' + #13#10 +
+                    'Установите вручную: ' + VCRedistUrl;
+      except
+        Result := 'Ошибка загрузки Visual C++ Runtime.' + #13#10 +
+                  'Проверьте интернет-соединение или установите вручную:' + #13#10 +
+                  VCRedistUrl;
+      end;
+    finally
+      PrereqPage.Hide;
+    end;
+
+    if Result <> '' then
+      Exit;
+  end;
+
+  InstallWebView2;
 end;
 
 // Остановить процесс при деинсталляции

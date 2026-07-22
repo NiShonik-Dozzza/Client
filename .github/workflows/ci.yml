@@ -1,0 +1,79 @@
+name: CI
+
+# Проверка на каждый push, а не только на тег.
+#
+# Раньше сборка под Windows и Linux случалась исключительно в release.yml, то
+# есть впервые — в момент выпуска. Нативная часть (WebView2 через NuGet на
+# Windows, webkit2gtk на Linux) ломается именно на уровне сборки, и узнавать об
+# этом при выкладке релиза поздно.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: '3.44.0'
+
+jobs:
+
+  analyze-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze lib test
+      - run: flutter test
+
+  # Собирается и приложение, и установщик: скрипт Inno Setup — такой же
+  # исходник, и синтаксическая ошибка в нём ломает релиз ровно так же, как
+  # ошибка в Dart.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build windows --release
+
+      - name: Build installer
+        run: |
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\efir-setup.iss
+
+      # Пригодится для ручной проверки HTML на живой Windows-машине: локально
+      # собрать нечем, если нет Visual Studio.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer-ci
+          path: packaging/windows/Output/*.exe
+          retention-days: 7
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev libblkid-dev liblzma-dev \
+            libmpv-dev libmpv1 \
+            libwebkit2gtk-4.1-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build linux --release

@@ -62,7 +62,19 @@ Documents/efir/
 
 ## Сборка из исходников
 
-Требования: Flutter 3.44 (stable), для Linux — `libmpv-dev`.
+Требования: Flutter 3.44 (stable).
+
+| Платформа | Что нужно дополнительно |
+| --- | --- |
+| Windows | Visual Studio с рабочей нагрузкой «Разработка классических приложений на C++». Сборка WebView-плагина тянет NuGet-пакеты (`Microsoft.Web.WebView2`, WIL), поэтому нужен доступ в интернет. |
+| Linux | `libmpv-dev`, `libwebkit2gtk-4.1-dev` |
+| Android | — |
+
+**HTML-страницам нужен WebView.** На Windows это рантайм WebView2: в Windows 10/11
+он обычно уже стоит, а установщик клиента доставит его сам, если нет. На Linux —
+пакет `libwebkit2gtk-4.1-0` (в Debian/Ubuntu ставится вместе с `-dev`).
+Без них клиент работает, но HTML-слоты пропускаются с записью в лог: видео,
+картинки и плейлисты не затрагиваются.
 
 ```bash
 flutter pub get

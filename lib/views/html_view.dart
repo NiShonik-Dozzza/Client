@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_all/webview_all.dart';
 
 import '../models/manifest.dart';
 import '../services/app_logger.dart';
@@ -39,9 +39,17 @@ class HtmlView extends StatefulWidget {
   /// Страница не смогла показаться. Плеер должен пропустить слот, а не ждать.
   final void Function(String reason)? onError;
 
-  /// Умеет ли эта платформа показывать HTML. На Linux встроенного WebView нет,
-  /// и честнее сказать об этом сразу, чем показывать чёрный прямоугольник.
-  static bool get isSupported => Platform.isAndroid || Platform.isIOS;
+  /// Умеет ли эта платформа показывать HTML.
+  ///
+  /// `webview_all` закрывает все наши цели: Android (System WebView), Windows
+  /// (WebView2) и Linux (WebKitGTK). Проверка осталась не как заглушка «здесь
+  /// не умеем», а как честный ответ для платформ, под которые мы не собираем и
+  /// не проверяем, — там лучше показать текст, чем чёрный прямоугольник.
+  static bool get isSupported =>
+      Platform.isAndroid ||
+      Platform.isIOS ||
+      Platform.isWindows ||
+      Platform.isLinux;
 
   @override
   State<HtmlView> createState() => _HtmlViewState();
@@ -83,25 +91,34 @@ class _HtmlViewState extends State<HtmlView> {
         pageId: widget.page.id,
       );
 
-      final controller = WebViewController()
-        ..setJavaScriptMode(JavaScriptMode.unrestricted)
-        ..setBackgroundColor(Colors.black)
-        ..addJavaScriptChannel('EfirBridge', onMessageReceived: _onBridgeMessage)
-        ..setNavigationDelegate(
-          NavigationDelegate(
-            // Страница живёт только внутри своего локального origin: клик по
-            // внешней ссылке не должен увести экран в чужой сайт.
-            onNavigationRequest: (request) {
-              final entry = _server.entryUrl(widget.page.entryPath);
-              return request.url.startsWith('http://${entry.host}:${entry.port}/')
-                  ? NavigationDecision.navigate
-                  : NavigationDecision.prevent;
-            },
-            onWebResourceError: (error) {
-              AppLogger.log('html page error: ${error.description}');
-            },
-          ),
-        );
+      final controller = WebViewController();
+
+      // Каждый шаг настройки — с await, каскад здесь недопустим. На WebView2
+      // канал регистрируется скриптом «выполнить при создании документа»: если
+      // навигация начнётся раньше, чем регистрация дойдёт до движка, у первой
+      // же страницы не окажется window.EfirBridge — и она молча не сможет
+      // сказать ни ready, ни done.
+      await controller.setJavaScriptMode(JavaScriptMode.unrestricted);
+      await controller.setBackgroundColor(Colors.black);
+      await controller.addJavaScriptChannel(
+        'EfirBridge',
+        onMessageReceived: _onBridgeMessage,
+      );
+      await controller.setNavigationDelegate(
+        NavigationDelegate(
+          // Страница живёт только внутри своего локального origin: клик по
+          // внешней ссылке не должен увести экран в чужой сайт.
+          onNavigationRequest: (request) {
+            final entry = _server.entryUrl(widget.page.entryPath);
+            return request.url.startsWith('http://${entry.host}:${entry.port}/')
+                ? NavigationDecision.navigate
+                : NavigationDecision.prevent;
+          },
+          onWebResourceError: (error) {
+            AppLogger.log('html page error: ${error.description}');
+          },
+        ),
+      );
 
       await controller.loadRequest(_server.entryUrl(widget.page.entryPath));
       if (!mounted) return;
