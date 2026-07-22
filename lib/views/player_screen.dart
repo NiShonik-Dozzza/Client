@@ -1239,6 +1239,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Directory? _htmlBundleDir;
   int _htmlEpoch = 0;
 
+  /// Как показывается текущая страница: элементом плейлиста или отдельным
+  /// слотом. Фиксируется в момент запуска показа и потом не пересчитывается.
+  ///
+  /// Раньше контекст выводился в `build()` из `_currentPlaylistItem`, а тот к
+  /// моменту перерисовки уже мог указывать на следующий элемент. Страницу из
+  /// плейлиста тогда принимали за одиночный слот и перезапускали на месте:
+  /// локальный сервер переезжал на новый порт из-под живой страницы, и все её
+  /// запросы начинали получать ERR_CONNECTION_REFUSED. Снаружи это выглядело
+  /// как «данных нет».
+  _PlaybackContext _htmlContext = _PlaybackContext.slotMedia;
+
   /// Готовит страницу к показу: бандл должен быть скачан и распакован.
   Future<bool> _prepareHtml(ManifestHtmlPage page) async {
     final controller = Get.find<PlaylistController>();
@@ -1285,6 +1296,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!mounted) return;
     setState(() {
       _htmlPage = page;
+      _htmlContext = context;
       _htmlEpoch += 1;
       _mode = _Mode.html;
       _imagePath = '';
@@ -1755,9 +1767,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Widget _buildHtmlView() {
     final page = _htmlPage!;
     final controller = Get.find<PlaylistController>();
-    final context = _currentPlaylistItem?.isHtml == true
-        ? _PlaybackContext.playlistItem
-        : _PlaybackContext.slotMedia;
+    final context = _htmlContext;
     return HtmlView(
       key: ValueKey('html-${page.id}-${page.versionNo}-$_htmlEpoch'),
       page: page,
