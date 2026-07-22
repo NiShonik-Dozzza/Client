@@ -1258,6 +1258,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// значит повесить слот до потолка длительности.
   bool _htmlDonePending = false;
 
+  /// Взводится на предыдущем элементе плейлиста: страница должна успеть
+  /// подняться и получить данные ДО того, как до неё дойдёт очередь.
+  Timer? _htmlWarmTimer;
+
   /// Готовит страницу к показу: бандл должен быть скачан и распакован.
   Future<bool> _prepareHtml(ManifestHtmlPage page) async {
     final controller = Get.find<PlaylistController>();
@@ -1283,6 +1287,57 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  /// Поднять страницу заранее — невидимой, пока играет предыдущий элемент.
+  ///
+  /// Это и есть предзагрузка: к моменту своей очереди страница уже нарисована
+  /// и сходила за данными. Раньше прогрев начинался после конца предыдущего
+  /// элемента, и вместо опережения получалась пауза на его последнем кадре.
+  Future<void> _warmHtml(ManifestHtmlPage page) async {
+    if (!HtmlView.isSupported) return;
+    if (_htmlPage?.id == page.id && _htmlPage?.versionNo == page.versionNo) {
+      return; // уже греется или показывается
+    }
+    if (!await _prepareHtml(page)) return;
+    if (!mounted) return;
+    setState(() {
+      _htmlPage = page;
+      _htmlEpoch += 1;
+      _htmlVisible = false;
+      _htmlDonePending = false;
+    });
+    await AppLogger.log('html warm: page=${page.id}:${page.name} v${page.versionNo}');
+  }
+
+  /// Следующий элемент плейлиста — HTML? Тогда взводим прогрев так, чтобы он
+  /// начался за preload_sec до конца текущего элемента.
+  void _armHtmlWarmup(Duration currentItemDuration) {
+    _htmlWarmTimer?.cancel();
+    _htmlWarmTimer = null;
+
+    final playlist = _currentPlaylist;
+    if (playlist == null || playlist.items.isEmpty) return;
+
+    final nextIndex = (_playlistIndex + 1) % playlist.items.length;
+    final next = playlist.items[nextIndex];
+    if (!next.isHtml) return;
+
+    final controller = Get.find<PlaylistController>();
+    final page = controller.manifest?.htmlPageById(next.contentId);
+    if (page == null) return;
+
+    final lead = Duration(seconds: page.preloadSec.clamp(0, 60));
+    if (lead == Duration.zero) return;
+
+    // Опережение не может быть длиннее самого элемента: тогда греем сразу.
+    var delay = currentItemDuration - lead;
+    if (delay.isNegative) delay = Duration.zero;
+
+    unawaited(AppLogger.log(
+      'html warmup armed: page=${page.id} in=${delay.inMilliseconds}ms lead=${lead.inSeconds}s',
+    ));
+    _htmlWarmTimer = Timer(delay, () => unawaited(_warmHtml(page)));
+  }
+
   Future<void> _playHtml(
     ManifestHtmlPage page, {
     required _PlaybackContext context,
@@ -1299,11 +1354,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    // Предзагрузка: страницу поднимаем невидимой, пока на экране ещё стоит
-    // предыдущий кадр. Почти всякая страница при старте идёт за данными, и
-    // показывать её в этот момент значит показывать пустой макет. Приём тот
-    // же, что у видео рядом в Stack: прогрев на нулевой непрозрачности.
-    final lead = page.preloadSec.clamp(0, 60);
+    // Страница уже греется с предыдущего элемента — показываем немедленно.
+    // Это нормальный путь: ждать здесь ещё раз значит впустую держать экран.
+    final alreadyWarm = !_htmlVisible &&
+        _htmlPage?.id == page.id &&
+        _htmlPage?.versionNo == page.versionNo;
+
+    // Запасной путь: прогреть не успели (страница первая в плейлисте, или
+    // предыдущий элемент оказался короче опережения). Тогда греем здесь, на
+    // последнем кадре предыдущего, — это хуже, но лучше пустого макета.
+    final lead = alreadyWarm ? 0 : page.preloadSec.clamp(0, 60);
     if (lead > 0) {
       if (!mounted) return;
       setState(() {
@@ -1327,7 +1387,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     setState(() {
       _htmlPage = page;
       _htmlContext = context;
-      if (lead == 0) _htmlEpoch += 1;
+      if (lead == 0 && !alreadyWarm) _htmlEpoch += 1;
       _htmlVisible = true;
       _mode = _Mode.html;
       _imagePath = '';
@@ -1454,6 +1514,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _stopEverything() async {
     _imageTimer?.cancel();
+    _htmlWarmTimer?.cancel();
+    _htmlWarmTimer = null;
     // Прогрев прерван или слот кончился: страница должна уйти из дерева вместе
     // со своим локальным сервером, иначе она продолжит жить невидимой и
     // ходить за данными.
@@ -1584,6 +1646,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       duration,
       () => unawaited(_onPlaylistItemCompleted(reason: 'image-timer')),
     );
+    // Следующий элемент — HTML? Начнём греть его за preload_sec до конца
+    // картинки, чтобы к своей очереди страница была готова.
+    _armHtmlWarmup(duration);
   }
 
   Future<void> _onVideoCompleted() async {
@@ -1967,6 +2032,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _isDisposed = true;
     _tick?.cancel();
     _slotTimer?.cancel();
+    _htmlWarmTimer?.cancel();
     _imageTimer?.cancel();
     _debugTimer?.cancel();
     _playbackTraceTimer?.cancel();
