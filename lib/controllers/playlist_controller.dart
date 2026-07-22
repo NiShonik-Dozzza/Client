@@ -1151,6 +1151,10 @@ class PlaylistController extends GetxController {
   ManifestMedia? mediaById(int id) => _manifest?.mediaById(id);
   ManifestPlaylist? playlistById(int id) => _manifest?.playlistById(id);
 
+  /// Токен устройства для локального моста HTML-страницы. Страница его не
+  /// видит: подставляет локальный сервер, а сюда ходит только плеер.
+  String get deviceToken => _auth?.token ?? '';
+
   Future<File?> ensureMediaFile(ManifestMedia media) =>
       _cache.ensureMediaFile(media, _mediaRoot);
 

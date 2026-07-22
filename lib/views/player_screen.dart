@@ -11,13 +11,15 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../controllers/playlist_controller.dart';
 import '../models/manifest.dart';
 import '../services/app_logger.dart';
+import '../services/html_bundle_service.dart';
+import 'html_view.dart';
 import '../views/editor_screen.dart'; // ← ДОБАВЛЕНО: импорт редактора
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:path/path.dart' as p;
 import '../models/playlist_item.dart';
 import '../services/config_service.dart';
 
-enum _Mode { image, video, black }
+enum _Mode { image, video, html, black }
 
 enum _PlaybackContext { slotMedia, playlistItem }
 
@@ -849,6 +851,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
+    if (nextSlot.contentType == ManifestContentType.html) {
+      final page = controller.manifest?.htmlPageById(nextSlot.contentId);
+      if (page == null) {
+        await AppLogger.log('html page not found: id=${nextSlot.contentId}');
+        setState(() => _mode = _Mode.black);
+        return;
+      }
+      await _playHtml(page, context: _PlaybackContext.slotMedia, slotContext: nextSlot);
+      return;
+    }
+
     final playlist = controller.playlistById(nextSlot.contentId);
     if (playlist == null || playlist.items.isEmpty) {
       await AppLogger.log('playlist not found/empty: id=${nextSlot.contentId}');
@@ -1219,6 +1232,83 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
   }
 
+  // Активная HTML-страница. Ключ меняется при каждом показе, чтобы Flutter
+  // пересоздал виджет: у страницы своё состояние и свой локальный сервер,
+  // переиспользовать их между слотами нельзя.
+  ManifestHtmlPage? _htmlPage;
+  Directory? _htmlBundleDir;
+  int _htmlEpoch = 0;
+
+  /// Готовит страницу к показу: бандл должен быть скачан и распакован.
+  Future<bool> _prepareHtml(ManifestHtmlPage page) async {
+    final controller = Get.find<PlaylistController>();
+    final bundle = controller.mediaById(page.bundleMediaId);
+    if (bundle == null) {
+      await AppLogger.log('html bundle missing in manifest: page=${page.id}');
+      return false;
+    }
+    final file = await controller.ensureMediaFile(bundle);
+    if (file == null) {
+      await AppLogger.log('html bundle not cached: page=${page.id}');
+      return false;
+    }
+    try {
+      final dir = await HtmlBundleService.ensureUnpacked(file, bundle.sha256);
+      _htmlBundleDir = dir;
+      return true;
+    } catch (e) {
+      // Битый или небезопасный архив: показывать нечего, но и падать нельзя —
+      // экран должен жить дальше.
+      await AppLogger.log('html bundle unpack failed: page=${page.id}: $e');
+      return false;
+    }
+  }
+
+  Future<void> _playHtml(
+    ManifestHtmlPage page, {
+    required _PlaybackContext context,
+    ManifestItem? slotContext,
+  }) async {
+    if (!HtmlView.isSupported) {
+      await AppLogger.log('html not supported on this platform: page=${page.id}');
+      await _onHtmlFinished(context);
+      return;
+    }
+    final ready = await _prepareHtml(page);
+    if (!ready) {
+      await _onHtmlFinished(context);
+      return;
+    }
+
+    // Видео и картинка уходят: экран показывает что-то одно.
+    await _stopEverything();
+    if (!mounted) return;
+    setState(() {
+      _htmlPage = page;
+      _htmlEpoch += 1;
+      _mode = _Mode.html;
+      _imagePath = '';
+    });
+    await AppLogger.log(
+      'html show: page=${page.id}:${page.name} v${page.versionNo} ctx=$context slot=${_slotLabel(slotContext ?? _currentSlot)}',
+    );
+  }
+
+  /// Страница закончила показ (сама, по потолку или из-за ошибки).
+  Future<void> _onHtmlFinished(_PlaybackContext context) async {
+    if (context == _PlaybackContext.playlistItem) {
+      await _onPlaylistItemCompleted(reason: 'html done');
+      return;
+    }
+    // Одиночный слот: перезапускаем страницу, пока слот не кончился, — иначе
+    // экран остался бы с замершим последним кадром до конца слота.
+    final page = _htmlPage;
+    if (page == null) return;
+    if (page.onDone == 'hold') return;
+    if (!mounted) return;
+    setState(() => _htmlEpoch += 1);
+  }
+
   Future<void> _playVideoSource(
     String source, {
     required bool loopSingle,
@@ -1500,12 +1590,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
     for (int i = index; i < playlist.items.length; i++) {
       final item = playlist.items[i];
       if (item.isHtml) {
-        // HTML внутри плейлиста ещё не подключён к циклу воспроизведения:
-        // пропускаем осознанно, вместо невнятного «медиа не найдено».
-        await AppLogger.log(
-          'playlist html item skipped: page=${item.contentId}',
-        );
-        continue;
+        final page = controller.manifest?.htmlPageById(item.contentId);
+        if (page == null) {
+          await AppLogger.log('playlist html page missing: page=${item.contentId}');
+          continue;
+        }
+        _playlistIndex = i;
+        _currentPlaylistItem = item;
+        await _playHtml(page, context: _PlaybackContext.playlistItem);
+        return;
       }
       final media = controller.mediaById(item.mediaId);
       if (media == null) {
@@ -1656,6 +1749,30 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _cancelPreparedVideo();
   }
 
+  /// Виджет страницы. Ключ включает эпоху показа: при повторном запуске
+  /// Flutter обязан пересоздать состояние, иначе страница не перезагрузится,
+  /// а локальный сервер останется от прошлого показа.
+  Widget _buildHtmlView() {
+    final page = _htmlPage!;
+    final controller = Get.find<PlaylistController>();
+    final context = _currentPlaylistItem?.isHtml == true
+        ? _PlaybackContext.playlistItem
+        : _PlaybackContext.slotMedia;
+    return HtmlView(
+      key: ValueKey('html-${page.id}-${page.versionNo}-$_htmlEpoch'),
+      page: page,
+      bundleDir: _htmlBundleDir!,
+      serverBase: controller.serverAddress,
+      deviceId: controller.deviceId,
+      deviceToken: controller.deviceToken,
+      onDone: () => unawaited(_onHtmlFinished(context)),
+      onError: (reason) {
+        AppLogger.log('html page error: ${page.id}: $reason');
+        unawaited(_onHtmlFinished(context));
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_initialized) {
@@ -1673,6 +1790,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       fit: StackFit.expand,
       children: [
         if (_mode == _Mode.image && _imagePath.isNotEmpty) _buildImageView(),
+        if (_mode == _Mode.html && _htmlPage != null && _htmlBundleDir != null)
+          Positioned.fill(child: _buildHtmlView()),
         for (var i = 0; i < _videoControllers.length; i++)
           Positioned.fill(
             child: IgnorePointer(
