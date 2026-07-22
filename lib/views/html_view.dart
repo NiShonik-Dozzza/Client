@@ -104,6 +104,20 @@ class _HtmlViewState extends State<HtmlView> {
         'EfirBridge',
         onMessageReceived: _onBridgeMessage,
       );
+      // Консоль страницы — в лог устройства.
+      //
+      // Без этого страница остаётся чёрным ящиком: она может ловить свои
+      // ошибки сама (а хорошо написанная именно так и делает) и снаружи это
+      // неотличимо от «данных просто нет». Диагностировать такое можно только
+      // подключив отладчик к экрану в холле, то есть практически никак.
+      await controller.setOnConsoleMessage((message) {
+        // Шум не нужен: info и debug страница пишет для себя.
+        if (message.level == JavaScriptLogLevel.error ||
+            message.level == JavaScriptLogLevel.warning) {
+          AppLogger.log('html console ${message.level.name}: ${message.message}');
+        }
+      });
+
       await controller.setNavigationDelegate(
         NavigationDelegate(
           // Страница живёт только внутри своего локального origin: клик по
