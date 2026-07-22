@@ -1250,6 +1250,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// как «данных нет».
   _PlaybackContext _htmlContext = _PlaybackContext.slotMedia;
 
+  /// Видна ли страница. Во время предзагрузки она уже в дереве и работает,
+  /// но на экране ещё стоит предыдущий кадр.
+  bool _htmlVisible = true;
+
+  /// Страница отчиталась done, пока была невидимой. Потерять этот сигнал
+  /// значит повесить слот до потолка длительности.
+  bool _htmlDonePending = false;
+
   /// Готовит страницу к показу: бандл должен быть скачан и распакован.
   Future<bool> _prepareHtml(ManifestHtmlPage page) async {
     final controller = Get.find<PlaylistController>();
@@ -1291,23 +1299,59 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
+    // Предзагрузка: страницу поднимаем невидимой, пока на экране ещё стоит
+    // предыдущий кадр. Почти всякая страница при старте идёт за данными, и
+    // показывать её в этот момент значит показывать пустой макет. Приём тот
+    // же, что у видео рядом в Stack: прогрев на нулевой непрозрачности.
+    final lead = page.preloadSec.clamp(0, 60);
+    if (lead > 0) {
+      if (!mounted) return;
+      setState(() {
+        _htmlPage = page;
+        _htmlContext = context;
+        _htmlEpoch += 1;
+        _htmlVisible = false;
+        _htmlDonePending = false;
+      });
+      await AppLogger.log(
+        'html preload: page=${page.id}:${page.name} lead=${lead}s',
+      );
+      await Future<void>.delayed(Duration(seconds: lead));
+      // За время прогрева слот мог смениться — тогда показывать уже нечего.
+      if (!mounted || _htmlPage?.id != page.id) return;
+    }
+
     // Видео и картинка уходят: экран показывает что-то одно.
     await _stopEverything();
     if (!mounted) return;
     setState(() {
       _htmlPage = page;
       _htmlContext = context;
-      _htmlEpoch += 1;
+      if (lead == 0) _htmlEpoch += 1;
+      _htmlVisible = true;
       _mode = _Mode.html;
       _imagePath = '';
     });
     await AppLogger.log(
       'html show: page=${page.id}:${page.name} v${page.versionNo} ctx=$context slot=${_slotLabel(slotContext ?? _currentSlot)}',
     );
+
+    // Страница успела отчитаться, пока была невидимой. Отложенный done
+    // обрабатываем здесь: потерять его значит повесить слот до потолка.
+    if (_htmlDonePending) {
+      _htmlDonePending = false;
+      await _onHtmlFinished(context);
+    }
   }
 
   /// Страница закончила показ (сама, по потолку или из-за ошибки).
   Future<void> _onHtmlFinished(_PlaybackContext context) async {
+    // Ещё идёт прогрев — досрочный done придержим до показа, иначе слот
+    // закончится, ни разу не появившись на экране.
+    if (!_htmlVisible) {
+      _htmlDonePending = true;
+      return;
+    }
     if (context == _PlaybackContext.playlistItem) {
       await _onPlaylistItemCompleted(reason: 'html done');
       return;
@@ -1410,6 +1454,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _stopEverything() async {
     _imageTimer?.cancel();
+    // Прогрев прерван или слот кончился: страница должна уйти из дерева вместе
+    // со своим локальным сервером, иначе она продолжит жить невидимой и
+    // ходить за данными.
+    if (_mode != _Mode.html && !_htmlVisible) {
+      _htmlVisible = true;
+      _htmlDonePending = false;
+    }
     _cancelPreparedVideo();
     _expectVideoCompleted = false;
     if (_mode == _Mode.video || _activeVideoSource != null) {
@@ -1800,8 +1851,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
       fit: StackFit.expand,
       children: [
         if (_mode == _Mode.image && _imagePath.isNotEmpty) _buildImageView(),
-        if (_mode == _Mode.html && _htmlPage != null && _htmlBundleDir != null)
-          Positioned.fill(child: _buildHtmlView()),
+        // Во время прогрева страница уже в дереве (грузится и ходит за
+        // данными), но не видна: непрозрачность как у прогреваемого видео
+        // ниже — нулевая убрала бы её из отрисовки вместе с загрузкой.
+        if (_htmlPage != null &&
+            _htmlBundleDir != null &&
+            (_mode == _Mode.html || !_htmlVisible))
+          Positioned.fill(
+            child: IgnorePointer(
+              ignoring: !_htmlVisible,
+              child: Opacity(
+                opacity: _htmlVisible && _mode == _Mode.html ? 1 : 0.001,
+                child: _buildHtmlView(),
+              ),
+            ),
+          ),
         for (var i = 0; i < _videoControllers.length; i++)
           Positioned.fill(
             child: IgnorePointer(

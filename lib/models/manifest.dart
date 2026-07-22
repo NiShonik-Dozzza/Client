@@ -388,6 +388,7 @@ class ManifestHtmlPage {
     required this.allowNetwork,
     required this.sourceKeys,
     required this.minDurationSec,
+    required this.preloadSec,
     required this.maxDurationSec,
     required this.readyTimeoutSec,
     required this.onDone,
@@ -406,6 +407,8 @@ class ManifestHtmlPage {
 
   /// Потолок показа. Страница сама сообщает о завершении через `efir.done()`,
   /// и без потолка одна сломанная строчка JS держала бы экран навсегда.
+  /// За сколько секунд до показа поднимать страницу.
+  final int preloadSec;
   final int maxDurationSec;
   final int readyTimeoutSec;
 
@@ -428,6 +431,7 @@ class ManifestHtmlPage {
           .map((e) => e.toString())
           .toList(),
       minDurationSec: _asInt(json['min_duration_sec']),
+      preloadSec: _asInt(json['preload_sec'], 1),
       maxDurationSec: _asInt(json['max_duration_sec'], 300),
       readyTimeoutSec: _asInt(json['ready_timeout_sec'], 15),
       onDone: (json['on_done'] as String?)?.trim() ?? 'next',
@@ -445,6 +449,7 @@ class ManifestHtmlPage {
     'allow_network': allowNetwork,
     'source_keys': sourceKeys,
     'min_duration_sec': minDurationSec,
+    'preload_sec': preloadSec,
     'max_duration_sec': maxDurationSec,
     'ready_timeout_sec': readyTimeoutSec,
     'on_done': onDone,
