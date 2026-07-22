@@ -281,8 +281,13 @@ class LocalWebServer {
         '&path=' + encodeURIComponent(opts.path || '/');
       return fetch(url, { headers: { Accept: 'application/json' } })
         .then(function (response) {
-          if (!response.ok) throw new Error('data ' + response.status);
-          return response.json();
+          if (response.ok) return response.json();
+          // Причину отказа отдаём странице как есть: «нет доступа к сети»
+          // и «источник недоступен» чинятся по-разному, и различать их
+          // должно быть видно на экране, а не только в логе.
+          return response.json().catch(function () { return {}; }).then(function (body) {
+            throw new Error(body.detail || ('data ' + response.status));
+          });
         })
         .then(function (payload) { return payload.value; });
     }
