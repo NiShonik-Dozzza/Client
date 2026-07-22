@@ -139,7 +139,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   String _playlistItemLabel(ManifestPlaylistItem? item) {
     if (item == null) return '-';
-    return 'item:${item.id} media=${item.mediaId} pos=${item.position} dur=${item.durationSec}s';
+    final target = item.isHtml ? 'html=${item.contentId}' : 'media=${item.contentId}';
+    return 'item:${item.id} $target pos=${item.position} dur=${item.durationSec}s';
   }
 
   String _mediaLabel(ManifestMedia? media) {
@@ -1498,6 +1499,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     for (int i = index; i < playlist.items.length; i++) {
       final item = playlist.items[i];
+      if (item.isHtml) {
+        // HTML внутри плейлиста ещё не подключён к циклу воспроизведения:
+        // пропускаем осознанно, вместо невнятного «медиа не найдено».
+        await AppLogger.log(
+          'playlist html item skipped: page=${item.contentId}',
+        );
+        continue;
+      }
       final media = controller.mediaById(item.mediaId);
       if (media == null) {
         await AppLogger.log('playlist media missing: media_id=${item.mediaId}');
@@ -1601,6 +1610,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     final item = playlist.items[nextIndex];
+    if (item.isHtml) {
+      // Предзагружать нечего: страница откроется из уже скачанного бандла.
+      _cancelPreparedVideo();
+      return;
+    }
     final media = controller.mediaById(item.mediaId);
     if (media == null) {
       await AppLogger.log(

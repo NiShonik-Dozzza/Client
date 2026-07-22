@@ -149,7 +149,7 @@ class _EditorScreenState extends State<EditorScreen> {
             final pl = manifest.playlistById(item.contentId);
             if (pl != null) {
               for (final pi in pl.items) {
-                mediaIds.add(pi.mediaId);
+                if (!pi.isHtml) mediaIds.add(pi.mediaId);
               }
             }
           }
@@ -756,6 +756,11 @@ class _EditorScreenState extends State<EditorScreen> {
       final children = <_TimelineEntry>[];
       if (playlist != null) {
         for (final pi in playlist.items) {
+          if (pi.isHtml) {
+            // Сервисный редактор показывает медиатеку; страницы правятся
+            // в панели, поэтому здесь только помечаем элемент.
+            continue;
+          }
           final media = manifest.mediaById(pi.mediaId);
           final isVideo = media?.isVideo ?? false;
           children.add(

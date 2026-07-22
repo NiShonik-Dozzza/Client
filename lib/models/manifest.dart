@@ -324,23 +324,40 @@ class ManifestPlaylist {
   };
 }
 
+/// Элемент плейлиста: медиа или HTML-страница.
 class ManifestPlaylistItem {
   final int id;
-  final int mediaId;
+  final ManifestContentType contentType;
+  final int contentId;
   final int durationSec;
   final int position;
 
   ManifestPlaylistItem({
     required this.id,
-    required this.mediaId,
+    required this.contentType,
+    required this.contentId,
     required this.durationSec,
     required this.position,
   });
 
+  bool get isHtml => contentType == ManifestContentType.html;
+
+  /// id медиа для элементов-медиа. У HTML-элемента медиа нет: бандл берётся
+  /// через страницу, поэтому здесь 0.
+  int get mediaId => isHtml ? 0 : contentId;
+
   factory ManifestPlaylistItem.fromJson(Map<String, dynamic> json) {
+    final rawType = (json['content_type'] as String?)?.trim().toLowerCase();
+    // Старый сервер присылал только media_id без типа — читаем и такой ответ,
+    // иначе обновлённый клиент перестал бы работать со старой панелью.
+    final type = rawType == 'html'
+        ? ManifestContentType.html
+        : ManifestContentType.media;
+    final id = _asNullableInt(json['content_id']) ?? _asInt(json['media_id']);
     return ManifestPlaylistItem(
       id: _asInt(json['id']),
-      mediaId: _asInt(json['media_id']),
+      contentType: type,
+      contentId: id,
       durationSec: _asInt(json['duration_sec'], 10),
       position: _asInt(json['position']),
     );
@@ -348,7 +365,9 @@ class ManifestPlaylistItem {
 
   Map<String, dynamic> toJson() => {
     'id': id,
-    'media_id': mediaId,
+    'content_type': isHtml ? 'html' : 'media',
+    'content_id': contentId,
+    'media_id': isHtml ? null : contentId,
     'duration_sec': durationSec,
     'position': position,
   };

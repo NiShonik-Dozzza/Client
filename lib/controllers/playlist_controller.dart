@@ -1000,14 +1000,28 @@ class PlaylistController extends GetxController {
       if (item.endTime.isBefore(now)) continue;
       if (item.startTime.isAfter(horizon)) continue;
 
-      if (item.contentType == ManifestContentType.media) {
-        ids.add(item.contentId);
-      } else {
-        final playlist = manifest.playlistById(item.contentId);
-        if (playlist == null) continue;
-        for (final pItem in playlist.items) {
-          ids.add(pItem.mediaId);
-        }
+      switch (item.contentType) {
+        case ManifestContentType.media:
+          ids.add(item.contentId);
+          break;
+        case ManifestContentType.html:
+          // Бандл страницы — обычное медиа, и качать его надо заранее так же,
+          // как видео: иначе слот начнётся с пустого экрана.
+          final page = manifest.htmlPageById(item.contentId);
+          if (page != null) ids.add(page.bundleMediaId);
+          break;
+        case ManifestContentType.playlist:
+          final playlist = manifest.playlistById(item.contentId);
+          if (playlist == null) continue;
+          for (final pItem in playlist.items) {
+            if (pItem.isHtml) {
+              final pagePage = manifest.htmlPageById(pItem.contentId);
+              if (pagePage != null) ids.add(pagePage.bundleMediaId);
+            } else {
+              ids.add(pItem.contentId);
+            }
+          }
+          break;
       }
     }
 
