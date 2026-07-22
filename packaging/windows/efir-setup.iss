@@ -61,18 +61,8 @@ Filename: "{app}\{#AppExeName}"; Description: "Запустить {#AppName}"; \
 Filename: "{app}\{#AppExeName}"; \
     Flags: nowait runasoriginaluser; Check: IsSilentInstall
 
-; Зарегистрировать watchdog в Task Scheduler после установки
-Filename: "powershell.exe"; \
-    Parameters: "-NonInteractive -ExecutionPolicy Bypass -File ""{app}\install-watchdog.ps1"" -AppPath ""{app}\{#AppExeName}"" -Silent"; \
-    Description: "Установить автозапуск (watchdog)"; \
-    Flags: runhidden runasoriginaluser; \
-    StatusMsg: "Настройка автозапуска..."
-
-[UninstallRun]
-; Удалить watchdog задачу при деинсталляции
-Filename: "powershell.exe"; \
-    Parameters: "-NonInteractive -ExecutionPolicy Bypass -Command ""Unregister-ScheduledTask -TaskName 'EFIR-Watchdog' -Confirm:$false -ErrorAction SilentlyContinue"""; \
-    Flags: runhidden
+; Watchdog регистрируется из [Code] (RegisterWatchdog): при тихом обновлении
+; выбор берётся из прошлой установки, а не из галочки, которую некому нажать.
 
 [Files]
 ; Flutter bundle — основное приложение и все .dll
@@ -92,18 +82,43 @@ Name: "{autodesktop}\{#AppName}";  Filename: "{app}\{#AppExeName}"; \
     Tasks: desktopicon
 
 [Tasks]
+; Watchdog — не просто автозапуск: задача в планировщике поднимает клиент при
+; входе в систему и перезапускает, если он упал. Для экрана в холле, к которому
+; никто не подходит, это единственный способ пережить сбой. Но для машины, где
+; клиент ставят посмотреть, круглосуточно висящая задача не нужна — поэтому
+; спрашиваем, а не навязываем.
+Name: "watchdog"; Description: "Следить за приложением и перезапускать при сбое"; \
+    GroupDescription: "Автозапуск:"
+
+; Простой автозапуск без слежения — на случай, если планировщик недоступен
+; (урезанная сборка Windows, политики домена).
+Name: "autorun"; Description: "Просто запускать при входе в систему"; \
+    GroupDescription: "Автозапуск:"; Flags: unchecked
+
 Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; \
     GroupDescription: "Дополнительно:"; Flags: unchecked
 
 [Registry]
-; Автозапуск через реестр — резервный вариант если Task Scheduler не сработал
+; Автозапуск через реестр — только если его выбрали явно. Раньше запись
+; создавалась при `Tasks: not desktopicon`, то есть автозапуск включался
+; отсутствием ярлыка на рабочем столе: связи между ними нет никакой.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     ValueType: string; ValueName: "{#AppName}"; \
     ValueData: """{app}\{#AppExeName}"""; \
-    Flags: uninsdeletevalue; Tasks: not desktopicon
+    Flags: uninsdeletevalue; Tasks: autorun
+
+; Выбор про watchdog запоминаем: при тихом автообновлении из панели галочку
+; нажать некому, и брать её надо из прошлой установки.
+Root: HKCU; Subkey: "Software\{#AppName}\Setup"; \
+    ValueType: dword; ValueName: "Watchdog"; ValueData: "1"; \
+    Flags: uninsdeletekey; Tasks: watchdog
+Root: HKCU; Subkey: "Software\{#AppName}\Setup"; \
+    ValueType: dword; ValueName: "Watchdog"; ValueData: "0"; \
+    Flags: uninsdeletekey; Tasks: not watchdog
 
 [Code]
 const
+  WatchdogTask = 'EFIR-Watchdog';
   VCRedistUrl  = 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
   { Evergreen Bootstrapper: ~2 МБ, сам скачивает и ставит актуальный рантайм. }
   WebView2Url  = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703';
@@ -118,6 +133,79 @@ var
 function IsSilentInstall: Boolean;
 begin
   Result := WizardSilent;
+end;
+
+// --------------------------------------------------------- прошлые установки
+// Ключ деинсталляции Inno лежит либо в HKCU (установка на пользователя), либо в
+// HKLM (на машину). Смотрим оба: одну и ту же программу могли поставить и так,
+// и так, и «прошлой версии нет» из-за проверки только одной ветки — это
+// установка второй копии рядом с работающей.
+function PreviousVersion(var Location: String): String;
+var
+  Key, Value: String;
+begin
+  Result := '';
+  Location := '';
+  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#AppId}_is1';
+
+  if RegQueryStringValue(HKCU, Key, 'DisplayVersion', Value) then begin
+    Result := Value;
+    Location := 'для текущего пользователя';
+    Exit;
+  end;
+  if RegQueryStringValue(HKLM, Key, 'DisplayVersion', Value) then begin
+    Result := Value;
+    Location := 'для всех пользователей';
+  end;
+end;
+
+// Запуск powershell без окна. Ошибки намеренно не фатальны: ни одна из этих
+// операций не стоит того, чтобы прервать установку клиента.
+function RunHiddenPS(const Command: String): Integer;
+begin
+  if not Exec('powershell.exe',
+      '-NonInteractive -ExecutionPolicy Bypass -Command "' + Command + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, Result) then
+    Result := -1;
+end;
+
+// Перед заменой файлов watchdog надо остановить.
+//
+// Иначе он делает ровно то, для чего создан: видит, что efir.exe закрылся, и
+// поднимает его обратно — прямо посреди копирования. Файлы оказываются
+// заняты, обновление падает на «не удалось заменить», и экран остаётся на
+// старой версии без единого внятного признака почему.
+procedure StopWatchdogAndApp;
+var
+  Code: Integer;
+begin
+  RunHiddenPS('Stop-ScheduledTask -TaskName ''' + WatchdogTask + ''' -ErrorAction SilentlyContinue; ' +
+              'Disable-ScheduledTask -TaskName ''' + WatchdogTask + ''' -ErrorAction SilentlyContinue');
+  Exec('taskkill.exe', '/F /IM {#AppExeName}', '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
+procedure UnregisterWatchdog;
+begin
+  RunHiddenPS('Unregister-ScheduledTask -TaskName ''' + WatchdogTask + ''' -Confirm:$false -ErrorAction SilentlyContinue');
+end;
+
+// Нужен ли watchdog.
+//
+// В обычной установке — как выбрал человек. В тихой (автообновление из панели)
+// галочки нет вовсе, поэтому берём выбор прошлой установки: обновление не
+// должно менять поведение экрана, о котором его никто не просил.
+function WantWatchdog: Boolean;
+var
+  Stored: Cardinal;
+begin
+  if not WizardSilent then begin
+    Result := WizardIsTaskSelected('watchdog');
+    Exit;
+  end;
+  if RegQueryDWordValue(HKCU, 'Software\{#AppName}\Setup', 'Watchdog', Stored) then
+    Result := (Stored <> 0)
+  else
+    Result := True;  // ставили до появления выбора — вели себя как с watchdog
 end;
 
 // Проверяем наличие VC++ 2015-2022 Redistributable x64 через реестр
@@ -167,6 +255,31 @@ begin
     'Загрузка компонентов с серверов Microsoft...',
     nil
   );
+end;
+
+// Страница «Всё готово к установке». Про найденную прошлую версию говорим
+// именно здесь: страница приветствия в Inno 6 по умолчанию скрыта
+// (DisableWelcomePage=yes), а эта показывается всегда.
+function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo,
+  MemoTypeInfo, MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
+var
+  Version, Location: String;
+begin
+  Result := '';
+  Version := PreviousVersion(Location);
+  if Version <> '' then begin
+    if Version = '{#AppVersion}' then
+      Result := 'Обновление:' + NewLine + Space +
+                'Версия {#AppVersion} уже установлена (' + Location + ') — будет переустановлена.' + NewLine + NewLine
+    else
+      Result := 'Обновление:' + NewLine + Space +
+                'Установлена версия ' + Version + ' (' + Location + ') → будет обновлена до {#AppVersion}.' + NewLine + Space +
+                'Регистрация экрана, журналы и кэш контента сохранятся.' + NewLine + NewLine;
+  end;
+
+  Result := Result + MemoDirInfo + NewLine + NewLine + MemoGroupInfo;
+  if MemoTasksInfo <> '' then
+    Result := Result + NewLine + NewLine + MemoTasksInfo;
 end;
 
 // Ставит WebView2 Runtime, если его нет.
@@ -223,6 +336,10 @@ var
 begin
   Result := '';
 
+  // Первым делом убрать с дороги watchdog и работающий клиент — иначе файлы
+  // будут заняты в момент замены.
+  StopWatchdogAndApp;
+
   if VCRedistNeedsInstall then begin
     // Runtime ставится только на всю машину — это единственное место, где нужен
     // администратор. При обычной пользовательской установке честно говорим, что
@@ -268,12 +385,70 @@ begin
   InstallWebView2;
 end;
 
-// Остановить процесс при деинсталляции
+// После установки: watchdog регистрируем или снимаем — по выбору.
+//
+// Снимать обязательно: если человек снял галочку при обновлении, задача от
+// прошлой установки осталась бы в планировщике и продолжила поднимать клиент.
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+
+  if WantWatchdog then begin
+    Exec('powershell.exe',
+      '-NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\install-watchdog.ps1') +
+      '" -AppPath "' + ExpandConstant('{app}\{#AppExeName}') + '" -Silent',
+      '', SW_HIDE, ewWaitUntilTerminated, Code);
+    if Code <> 0 then
+      Log('watchdog registration failed with code ' + IntToStr(Code));
+    // Ключ реестра пишется секцией [Registry] по галочке; в тихом режиме
+    // галочки нет, поэтому проставляем сохранённый выбор здесь же.
+    if WizardSilent then
+      RegWriteDWordValue(HKCU, 'Software\{#AppName}\Setup', 'Watchdog', 1);
+  end else begin
+    UnregisterWatchdog;
+    if WizardSilent then
+      RegWriteDWordValue(HKCU, 'Software\{#AppName}\Setup', 'Watchdog', 0);
+  end;
+end;
+
+// --------------------------------------------------------------- удаление
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
+  DataDir: String;
 begin
   if CurUninstallStep = usUninstall then begin
+    // Порядок важен: сначала снять watchdog, потом убивать процесс. Наоборот —
+    // watchdog успеет поднять клиент заново, и файлы останутся занятыми.
+    UnregisterWatchdog;
     Exec('taskkill.exe', '/F /IM {#AppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+
+  if CurUninstallStep = usPostUninstall then begin
+    // Данные клиента: кэш медиа, логи и — главное — device.json с токеном
+    // регистрации экрана. Удалить его значит потерять регистрацию: экран
+    // придётся заново одобрять в панели. Поэтому спрашиваем и по умолчанию
+    // оставляем; при тихом удалении не трогаем вовсе.
+    DataDir := ExpandConstant('{userdocs}\efir');
+    if not DirExists(DataDir) then
+      Exit;
+    if UninstallSilent then
+      Exit;
+
+    if MsgBox('Удалить данные клиента?' + #13#10#13#10 +
+              DataDir + #13#10#13#10 +
+              'Там кэш контента, журналы и регистрация экрана в панели.' + #13#10 +
+              'Если удалить — экран придётся заново одобрять в панели.' + #13#10 +
+              'Если оставить — при повторной установке всё подхватится само.',
+              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    begin
+      if not DelTree(DataDir, True, True, True) then
+        MsgBox('Не удалось удалить папку целиком:' + #13#10 + DataDir + #13#10#13#10 +
+               'Возможно, часть файлов занята. Удалите её вручную.',
+               mbInformation, MB_OK);
+    end;
   end;
 end;
