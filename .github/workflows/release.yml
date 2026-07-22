@@ -279,7 +279,11 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           name: "EFIR Client ${{ github.ref_name }}"
-          draft: true
+          # Публикуем сразу: GitHub Release — обычный способ скачать и
+          # поставить клиент вручную, и лишний ручной шаг только задерживает
+          # страницу загрузки. Раздача на работающие экраны идёт отдельно,
+          # через раздел «Обновления» в панели.
+          draft: false
           prerelease: false
           generate_release_notes: true
           files: |
