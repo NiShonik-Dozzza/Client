@@ -1095,6 +1095,33 @@ class PlaylistController extends GetxController {
     }
   }
 
+  /// Диагностика текущего HTML-слота — уезжает в heartbeat, панель показывает
+  /// её на карточке экрана. Раньше события ready/done/ошибок оставались только
+  /// в логе устройства, и «почему на экране висит не то» было не отладить.
+  Map<String, dynamic>? _htmlStatus;
+  int _htmlCeilingHits = 0;
+
+  void reportHtmlStatus({
+    required int pageId,
+    required String pageName,
+    required int versionNo,
+    required String state,
+    String detail = '',
+  }) {
+    // Потолок показа копим за всё время работы: разовое срабатывание — случайность,
+    // а постоянное — сломанная страница, которая не умеет заканчивать.
+    if (state == 'ceiling') _htmlCeilingHits += 1;
+    _htmlStatus = {
+      'page_id': pageId,
+      'page_name': pageName,
+      'version_no': versionNo,
+      'state': state,
+      if (detail.isNotEmpty) 'detail': detail,
+      'ceiling_hits': _htmlCeilingHits,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    };
+  }
+
   Future<void> _sendHeartbeat() async {
     if (isOfflineMode.value || !isReady) return;
 
@@ -1118,6 +1145,7 @@ class PlaylistController extends GetxController {
         mediaDownloadFailures: cacheDiagnostics.downloadFailures,
         activeDisplayId: _activeDisplayId.value,
         availableDisplays: availableDisplays,
+        htmlStatus: _htmlStatus,
         token: auth.token,
       );
       lastHeartbeatAt.value = DateTime.now();

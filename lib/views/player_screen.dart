@@ -1395,6 +1395,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await AppLogger.log(
       'html show: page=${page.id}:${page.name} v${page.versionNo} ctx=$context slot=${_slotLabel(slotContext ?? _currentSlot)}',
     );
+    // Слот HTML начался. Дальше сама страница отчитается ready/done/ошибкой;
+    // «showing» же ловит случай, когда она вообще не подала признаков жизни.
+    Get.find<PlaylistController>().reportHtmlStatus(
+      pageId: page.id,
+      pageName: page.name,
+      versionNo: page.versionNo,
+      state: 'showing',
+    );
 
     // Страница успела отчитаться, пока была невидимой. Отложенный done
     // обрабатываем здесь: потерять его значит повесить слот до потолка.
@@ -1896,6 +1904,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
         AppLogger.log('html page error: ${page.id}: $reason');
         unawaited(_onHtmlFinished(context));
       },
+      onStatus: (state, detail) => controller.reportHtmlStatus(
+        pageId: page.id,
+        pageName: page.name,
+        versionNo: page.versionNo,
+        state: state,
+        detail: detail,
+      ),
     );
   }
 

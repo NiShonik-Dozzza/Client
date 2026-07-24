@@ -180,6 +180,7 @@ class ApiService {
     required int mediaDownloadFailures,
     required String activeDisplayId,
     required List<DeviceDisplayProfile> availableDisplays,
+    Map<String, dynamic>? htmlStatus,
     String? token,
   }) async {
     final resp = await _client.post(
@@ -202,6 +203,7 @@ class ApiService {
         'available_displays': availableDisplays
             .map((item) => item.toJson())
             .toList(),
+        if (htmlStatus != null) 'html_status': htmlStatus,
       }),
     );
     _decodeMap(resp);

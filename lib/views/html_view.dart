@@ -25,6 +25,7 @@ class HtmlView extends StatefulWidget {
     required this.deviceToken,
     required this.onDone,
     this.onError,
+    this.onStatus,
   });
 
   final ManifestHtmlPage page;
@@ -38,6 +39,11 @@ class HtmlView extends StatefulWidget {
 
   /// Страница не смогла показаться. Плеер должен пропустить слот, а не ждать.
   final void Function(String reason)? onError;
+
+  /// События контракта для диагностики в панели: ready/progress/done/ceiling/
+  /// error. Раньше они уходили только в лог устройства, и «почему на экране
+  /// висит не то» было видно лишь с отладчиком у самого экрана.
+  final void Function(String state, String detail)? onStatus;
 
   /// Умеет ли эта платформа показывать HTML.
   ///
@@ -152,7 +158,12 @@ class _HtmlViewState extends State<HtmlView> {
     // скажет done().
     _maxDurationTimer = Timer(
       Duration(seconds: widget.page.maxDurationSec),
-      () => _finish(reason: 'достигнут предел показа'),
+      () {
+        // Потолок — это не «done»: в панели важно различать «страница сама
+        // закончила» и «её сняли по таймеру, потому что она не закончила».
+        widget.onStatus?.call('ceiling', 'достигнут предел показа');
+        _finish(reason: 'достигнут предел показа');
+      },
     );
 
     // Не дождались ready — считаем, что страница не поднялась.
@@ -179,16 +190,20 @@ class _HtmlViewState extends State<HtmlView> {
     switch (payload['kind']) {
       case 'ready':
         _readyTimer?.cancel();
+        widget.onStatus?.call('ready', '');
         break;
       case 'done':
+        widget.onStatus?.call('done', '');
         _finish(reason: 'страница сообщила done');
         break;
       case 'error':
         _fail('${payload['payload'] ?? 'ошибка страницы'}');
         break;
       case 'progress':
-        // Прогресс уходит в лог: по нему видно, что страница жива и листает.
-        AppLogger.log('html page progress: ${payload['payload']}');
+        // Прогресс уходит в лог и в панель: видно, что страница жива и листает.
+        final progress = '${payload['payload'] ?? ''}';
+        widget.onStatus?.call('progress', progress);
+        AppLogger.log('html page progress: $progress');
         break;
     }
   }
@@ -214,6 +229,7 @@ class _HtmlViewState extends State<HtmlView> {
   void _fail(String reason) {
     if (_finished) return;
     _finished = true;
+    widget.onStatus?.call('error', reason);
     if (mounted) setState(() => _error = reason);
     AppLogger.log('html page failed: ${widget.page.name} — $reason');
     final onError = widget.onError;
